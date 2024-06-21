@@ -2,6 +2,8 @@
 
 #![allow(dead_code)]
 
+use crate::hashing::CustomXxh3Hasher;
+use crate::timesince::TimeSinceEpoch;
 use libc;
 use nix::{
     dir::{Dir, Entry, Iter, Type},
@@ -262,11 +264,115 @@ fn get_file_handle(path: &Path) -> io::Result<File> {
 }
 
 /**
-A wrapper around the raw file descriptor of a `DirHandle` object.
-The lifetime parameter `'handle` is used to annotate that the raw file
-descriptor is only valid while the `DirHandle` object exists.
+The type of change detected in a directory, if any.
+
+`DirectoryNum` or `FileNum` change also implies a change of `DirectoryHash`
+or `FileHash`, respectively, but the reverse is not true. But since we first
+check for `DirectoryNum` and `FileNum` changes, that doesn't matter.
 */
-struct DirHandleRawFd<'handle>(RawFd, PhantomData<&'handle DirHandle>);
+#[derive(Debug)]
+pub enum StateChange {
+    Unchanged,
+    /// Directory count change (positive or negative)
+    DirectoryNum(i32),
+    /// File count change (positive or negative)
+    FileNum(i32),
+    /// Same directory count, but hash of dir entries has changed
+    DirectoryHash,
+    /// Same file count, but hash of file entries has changed
+    FileHash,
+}
+
+impl StateChange {
+    pub fn is_same(&self) -> bool {
+        match self {
+            StateChange::Unchanged => true,
+            _ => false,
+        }
+    }
+}
+
+/// This struct holds the state of a directory for change detection.
+#[derive(Debug)]
+pub struct DirectoryState {
+    num_dirs: usize,
+    num_files: usize,
+    hash_dirs: u64,
+    hash_files: u64,
+    when: Option<TimeSinceEpoch>,
+}
+
+impl DirectoryState {
+    /// Update the state object with new values if they differ.
+    fn update(&mut self, state: DirectoryState) {
+        match self == &state {
+            true => self.when = state.when,
+            false => *self = state,
+        }
+    }
+
+    /// Compare two states and return the type of change as a [StateChange] enum.
+    pub fn change_type(&self, other: &Self) -> StateChange {
+        if self.num_dirs != other.num_dirs {
+            return StateChange::DirectoryNum(self.num_dirs as i32 - other.num_dirs as i32);
+        }
+        if self.num_files != other.num_files {
+            return StateChange::FileNum(self.num_files as i32 - other.num_files as i32);
+        }
+        if self.hash_dirs != other.hash_dirs {
+            return StateChange::DirectoryHash;
+        }
+        if self.hash_files != other.hash_files {
+            return StateChange::FileHash;
+        }
+        StateChange::Unchanged
+    }
+
+    /// Combined hash of directory and file entry hashes.
+    pub fn hash_all(&self) -> u64 {
+        self.hash_dirs.rotate_left(32) ^ self.hash_files
+    }
+}
+
+impl Default for DirectoryState {
+    fn default() -> Self {
+        Self {
+            num_dirs: 0,
+            num_files: 0,
+            hash_dirs: 0,
+            hash_files: 0,
+            when: None,
+        }
+    }
+}
+
+impl Eq for DirectoryState {}
+
+impl PartialEq for DirectoryState {
+    fn eq(&self, other: &Self) -> bool {
+        self.num_dirs == other.num_dirs
+            && self.num_files == other.num_files
+            && self.hash_dirs == other.hash_dirs
+            && self.hash_files == other.hash_files
+    }
+}
+
+/// Return the state of a directory as a [DirectoryState] object.
+#[instrument(level = "trace", skip_all, ret)]
+fn directory_state(dir: &mut DirHandle) -> DirectoryState {
+    let (dirs, files) = dir.entries_sorted();
+    let mut xxh: CustomXxh3Hasher = CustomXxh3Hasher::default();
+    dirs.hash(&mut xxh);
+    let dh: u64 = xxh.reset();
+    files.hash(&mut xxh);
+    DirectoryState {
+        num_dirs: dirs.len(),
+        num_files: files.len(),
+        hash_dirs: dh,
+        hash_files: xxh.finish(),
+        when: TimeSinceEpoch::new().into(),
+    }
+}
 
 type EntryVec = Vec<EntryExt>;
 
@@ -275,7 +381,7 @@ An open handle to a directory, internally a [nix::dir::Dir] object. The aim
 is to be somewhat compatible with the [std::fs::ReadDir] API, with the
 following notable differences / enhancements:
 
-- `iter_sort()` sorts the returned entries alphabetically
+- `iter_sorted()` sorts the returned entries alphabetically
 - `iter()` rewinds after finishing, so it can be called multiple times
 - `path()` returns the canonicalized path of the directory
   (relies on procfs being available and the inner Dir being open)
@@ -283,19 +389,21 @@ following notable differences / enhancements:
   - numbers of directories and files are cached
   - hashes of directory and file entry names are cached
 
-NOTE: the counts and hashes are updated when the directory is iterated,
-or when asked for explicitly, but they are not updated automatically
-if the directory is changed externally.
+NOTE: the counts and hashes are updated when the directory is iterated for
+the first time, or when asked for explicitly, but they are **not** updated
+automatically if the directory is changed externally.
 
-NOTE: the `DirHandle` object is not thread-safe, and it is not intended
+NOTE: the [DirHandle] object is not thread-safe, and it is not intended
 to be shared between threads, see the following `readdir` manual:
 https://www.gnu.org/software/libc/manual/html_node/Reading_002fClosing-Directory.html
+
 Future versions of POSIX are likely to obsolete `readdir_r` and specify that it's
 unsafe to call `readdir` simultaneously from multiple threads.
 */
 #[derive(Debug, Eq)]
 pub struct DirHandle {
     inner: Dir,
+    state: DirectoryState,
 }
 
 impl DirHandle {
@@ -304,12 +412,8 @@ impl DirHandle {
     pub fn new(path: &Path) -> io::Result<Self> {
         Ok(Self {
             inner: get_dir_handle(path)?,
+            state: DirectoryState::default(),
         })
-    }
-
-    /// Return the raw file descriptor of the inner [nix::dir::Dir] object.
-    fn raw_fd<'handle>(&'handle self) -> DirHandleRawFd<'handle> {
-        DirHandleRawFd(self.as_raw_fd(), PhantomData)
     }
 
     /**
@@ -317,7 +421,25 @@ impl DirHandle {
     `/proc/self/fd` to resolve the path by file descriptor.
     */
     pub fn path(&self) -> io::Result<PathBuf> {
-        Ok(read_link(format!("/proc/self/fd/{}", self.raw_fd().0))?)
+        Ok(read_link(format!("/proc/self/fd/{}", self.as_raw_fd()))?)
+    }
+
+    /// Stored state of the directory as a [DirectoryState] object.
+    pub fn state(&self) -> &DirectoryState {
+        &self.state
+    }
+
+    /// Current state of the directory as a [DirectoryState] object.
+    pub fn state_current(&mut self) -> DirectoryState {
+        directory_state(self)
+    }
+
+    /// Whether the state has changed. Also updates the stored state if so.
+    pub fn state_changed(&mut self) -> bool {
+        let current: DirectoryState = self.state_current();
+        let changed: StateChange = self.state.change_type(&current);
+        self.state.update(current);
+        !changed.is_same()
     }
 
     /// Return the inner [nix::dir::Iter] object and make it `Peekable`.
@@ -333,11 +455,38 @@ impl DirHandle {
       entries before other entries (NOTE: not a guarantee)
     */
     pub fn iter<'handle>(&'handle mut self) -> DirHandleIter<'handle> {
-        DirHandleIter {
-            dirfd: self.as_raw_fd(),
-            inner: self.inner.iter().peekable(),
-            buf: BufDeque::default(),
-        }
+        DirHandleIter::new(self)
+    }
+
+    /// Return the directory entries as a tuple of directories and files.
+    /// The booleans specify whether to include directories and/or files.
+    pub fn entries<'handle>(&'handle mut self, dirs: bool, files: bool) -> (EntryVec, EntryVec) {
+        let mut d_vec: EntryVec = Vec::new();
+        let mut f_vec: EntryVec = Vec::new();
+        self.iter().for_each(|entry: EntryExt| {
+            match entry.file_type() {
+                Some(Type::Directory) => {
+                    if dirs {
+                        d_vec.push(entry)
+                    }
+                }
+                Some(_) => {
+                    if files {
+                        f_vec.push(entry)
+                    }
+                }
+                None => {} // ignore unknown file types
+            }
+        });
+        (d_vec, f_vec)
+    }
+
+    /// Return the directory entries as sorted tuples of directories and files.
+    pub fn entries_sorted<'handle>(&'handle mut self) -> (EntryVec, EntryVec) {
+        let (mut dirs, mut files) = self.entries(true, true);
+        dirs.sort_by(|a, b| a.cmp(b));
+        files.sort_by(|a, b| a.cmp(b));
+        (dirs, files)
     }
 
     /**
@@ -347,20 +496,13 @@ impl DirHandle {
     - sorts both entry lists alphabetically (separately)
     */
     pub fn iter_sorted<'handle>(&'handle mut self) -> DirHandleIterSorted<'handle> {
-        let mut dirs: EntryVec = Vec::new();
-        let mut files: EntryVec = Vec::new();
-        self.iter().for_each(|entry: EntryExt| {
-            match entry.file_type() {
-                Some(Type::Directory) => dirs.push(entry),
-                Some(_) => files.push(entry),
-                None => {} // ignore unknown file types
-            }
-        });
+        let (mut dirs, mut files) = self.entries(true, true);
 
         // NOTE: we sort in reverse order to pop the entries in alphabetical order
         dirs.sort_by(|a, b| b.cmp(a));
         files.sort_by(|a, b| b.cmp(a));
-        DirHandleIterSorted(files.into_iter().chain(dirs.into_iter()).collect(), PhantomData)
+        files.extend_from_slice(&dirs);
+        DirHandleIterSorted(files, PhantomData)
     }
 }
 
@@ -486,9 +628,30 @@ pub struct DirHandleIter<'handle> {
     inner: Peekable<Iter<'handle>>,
     dirfd: RawFd,
     buf: BufDeque<EntryExt>,
+    state: &'handle mut DirectoryState,
+    /// dir entry names and corresponding hashes
+    dirs: Vec<(String, u64)>,
+    /// file entry names and corresponding hashes
+    files: Vec<(String, u64)>,
+    /// resettable hasher for calculating entry hashes
+    xxh: CustomXxh3Hasher,
+    update: bool,
 }
 
 impl<'handle> DirHandleIter<'handle> {
+    pub fn new(handle: &'handle mut DirHandle) -> Self {
+        Self {
+            dirfd: handle.as_raw_fd(),
+            inner: handle.inner.iter().peekable(),
+            buf: BufDeque::default(),
+            update: handle.state.when.is_none(),
+            state: &mut handle.state,
+            dirs: Vec::new(),
+            files: Vec::new(),
+            xxh: CustomXxh3Hasher::default(),
+        }
+    }
+
     /// Is the inner iterator done?
     #[inline]
     fn done(&mut self) -> bool {
@@ -511,9 +674,25 @@ impl<'handle> DirHandleIter<'handle> {
     }
 
     /// Get one entry from the inner iterator.
-    #[inline]
     fn get_one(&mut self) -> Option<EntryExt> {
-        next(&mut self.inner, self.dirfd)
+        if let Some(entry) = next(&mut self.inner, self.dirfd) {
+            if self.update {
+                // store each entry name and its hash for later use
+                entry.hash(&mut self.xxh);
+                match entry.file_type() {
+                    Some(Type::Directory) => {
+                        self.dirs.push((entry.name().to_string(), self.xxh.reset()))
+                    }
+                    Some(_) => self
+                        .files
+                        .push((entry.name().to_string(), self.xxh.reset())),
+                    None => {} // unknown file type
+                }
+            }
+            Some(entry)
+        } else {
+            None
+        }
     }
 
     /// Fill the lookahead buffer with entries.
@@ -572,6 +751,28 @@ impl<'handle> Iterator for DirHandleIter<'handle> {
                 }
             } else if self.done() {
                 debug!(target: "DirHandleIter::next", "iter_done: {:?}", self.inner);
+                if self.update {
+                    // sort the data, use the hasher to build state from
+                    // precalculated values and then set DirHandle state
+                    self.dirs.sort_by(|a, b| a.0.cmp(&b.0));
+                    self.files.sort_by(|a, b| a.0.cmp(&b.0));
+                    self.state.num_dirs = self.dirs.len();
+                    self.state.num_files = self.files.len();
+                    self.state.when = TimeSinceEpoch::new().into();
+
+                    self.xxh.reset(); // just in case...
+                    self.dirs.iter().for_each(|(_, hash)| {
+                        self.xxh.write_u64(*hash);
+                    });
+                    self.state.hash_dirs = self.xxh.reset();
+
+                    self.files.iter().for_each(|(_, hash)| {
+                        self.xxh.write_u64(*hash);
+                    });
+                    self.state.hash_files = self.xxh.reset();
+
+                    trace!(target: "DirHandle.state", "{:?}", self.state);
+                }
                 return None;
             } else if self.buf.is_empty() {
                 self.fill_buffer();
