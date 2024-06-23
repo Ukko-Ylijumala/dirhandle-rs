@@ -2,7 +2,8 @@
 
 #![allow(dead_code)]
 
-use crate::hashing::CustomXxh3Hasher;
+use crate::enhvec::EnhVec;
+use crate::hashing::{hash_item, CustomXxh3Hasher, Xxh3Hashable};
 use crate::timesince::TimeSinceEpoch;
 use libc;
 use nix::{
@@ -85,6 +86,8 @@ impl EntryType {
         }
     }
 }
+
+/* ######################################################################### */
 
 /**
 This struct extends the [nix::dir::Entry] struct with additional methods.
@@ -218,13 +221,7 @@ impl EntryExt {
     }
 }
 
-impl Hash for EntryExt {
-    #[inline]
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.entry.hash(state);
-        self.dirfd.hash(state);
-    }
-}
+/* --------------------------------- */
 
 impl PartialEq for EntryExt {
     fn eq(&self, other: &Self) -> bool {
@@ -253,15 +250,30 @@ impl Deref for EntryExt {
     }
 }
 
-/// Open a directory and return its handle.
-fn get_dir_handle(path: &Path) -> io::Result<Dir> {
-    Ok(Dir::open(path, OFlag::O_RDONLY, Mode::empty())?)
+/* --------------------------------- */
+
+impl Hash for EntryExt {
+    #[inline]
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.entry.hash(state);
+        // TODO: should we hash the dirfd as well? If we do, we invalidate
+        // the hash most likely if we close the directory and open it again.
+        // Needs testing.
+        //self.dirfd.hash(state);
+    }
 }
 
-/// Open a file and return its handle.
-fn get_file_handle(path: &Path) -> io::Result<File> {
-    Ok(OpenOptions::new().read(true).open(path)?)
+impl Xxh3Hashable for EntryExt {
+    fn xxh3<H: Hasher>(&self, state: &mut H) {
+        self.entry.hash(state);
+    }
+
+    fn xxh3_digest(&self) -> u64 {
+        hash_item(&self.entry)
+    }
 }
+
+/* ######################################################################### */
 
 /**
 The type of change detected in a directory, if any.
@@ -291,6 +303,8 @@ impl StateChange {
         }
     }
 }
+
+/* --------------------------------- */
 
 /// This struct holds the state of a directory for change detection.
 #[derive(Debug)]
@@ -357,24 +371,10 @@ impl PartialEq for DirectoryState {
     }
 }
 
-/// Return the state of a directory as a [DirectoryState] object.
-#[instrument(level = "trace", skip_all, ret)]
-fn directory_state(dir: &mut DirHandle) -> DirectoryState {
-    let (dirs, files) = dir.entries_sorted();
-    let mut xxh: CustomXxh3Hasher = CustomXxh3Hasher::default();
-    dirs.hash(&mut xxh);
-    let dh: u64 = xxh.reset();
-    files.hash(&mut xxh);
-    DirectoryState {
-        num_dirs: dirs.len(),
-        num_files: files.len(),
-        hash_dirs: dh,
-        hash_files: xxh.finish(),
-        when: TimeSinceEpoch::new().into(),
-    }
-}
+/* ######################################################################### */
 
-type EntryVec = Vec<EntryExt>;
+// Convenience type alias.
+type EntryVec = EnhVec<EntryExt>;
 
 /**
 An open handle to a directory, internally a [nix::dir::Dir] object. The aim
@@ -461,8 +461,8 @@ impl DirHandle {
     /// Return the directory entries as a tuple of directories and files.
     /// The booleans specify whether to include directories and/or files.
     pub fn entries<'handle>(&'handle mut self, dirs: bool, files: bool) -> (EntryVec, EntryVec) {
-        let mut d_vec: EntryVec = Vec::new();
-        let mut f_vec: EntryVec = Vec::new();
+        let mut d_vec: EntryVec = EnhVec::new();
+        let mut f_vec: EntryVec = EnhVec::new();
         self.iter().for_each(|entry: EntryExt| {
             match entry.file_type() {
                 Some(Type::Directory) => {
@@ -506,6 +506,8 @@ impl DirHandle {
     }
 }
 
+/* --------------------------------- */
+
 impl Hash for DirHandle {
     #[inline]
     fn hash<H: Hasher>(&self, state: &mut H) {
@@ -530,36 +532,7 @@ impl AsRawFd for DirHandle {
     }
 }
 
-/**
-Return the next entry from the inner [nix::dir::Iter] as an `EntryExt`,
-skipping `.` and `..`. Also skips entries where the file type cannot be
-determined (e.g. due to permission denied).
-*/
-#[instrument(level = "trace", skip(it))]
-fn next(it: &mut Peekable<Iter>, dirfd: RawFd) -> Option<EntryExt> {
-    it.filter_map(Result::ok)
-        .filter_map(|entry| {
-            // Sadly it appears that we cannot rely on the special "." and ".."
-            // entries being returned first by the libc `readdir` call, so to
-            // filter them out we must match each name.
-            if matches!(entry.file_name().to_bytes(), DOT1 | DOT2) {
-                return None;
-            }
-
-            // convert the [nix::dir::Entry] to our `EntryExt`
-            let entry: EntryExt = EntryExt::new(entry, dirfd);
-            if let Some(_) = entry.file_type() {
-                trace!(target: "name", "{:?} : {:?}", entry.name(), entry);
-                Some(entry)
-            } else {
-                // we ignore the entry if we can't determine its type
-                // (e.g. permission denied, unknown type)
-                trace!(target: "name", "{:?} : {:?} (skipping, no type)", entry.name(), entry);
-                return None;
-            }
-        })
-        .next()
-}
+/* ######################################################################### */
 
 /**
 A wrapper around [std::collections::VecDeque] that provides additional
@@ -602,6 +575,8 @@ impl BufDeque<EntryExt> {
     }
 }
 
+/* --------------------------------- */
+
 impl Default for BufDeque<EntryExt> {
     fn default() -> Self {
         Self::new(LOOKAHEAD_BUFFER_SIZE)
@@ -621,6 +596,8 @@ impl<T> DerefMut for BufDeque<T> {
         &mut self.0
     }
 }
+
+/* ######################################################################### */
 
 /// The return type of [DirHandle::iter]
 #[derive(Debug)]
@@ -679,6 +656,17 @@ impl<'handle> DirHandleIter<'handle> {
             if self.update {
                 // store each entry name and its hash for later use
                 entry.hash(&mut self.xxh);
+
+                #[cfg(debug_assertions)]
+                {
+                    let tmp_hash = hash_item(&entry);
+                    let tmp_vec: EntryVec = EnhVec::new_from(vec![entry.clone()]);
+                    let vec_hash = hash_item(&tmp_vec);
+                    debug!(target: "get_one",
+                "{:?} : xxh_hash: {}, tmp_hash: {tmp_hash:?}, vec_hash: {vec_hash}, vec_xxh3: {}",
+                entry.name(), self.xxh.finish(), tmp_vec.xxh3_digest());
+                } // END DEBUG -- TODO: REMOVE
+
                 match entry.file_type() {
                     Some(Type::Directory) => {
                         self.dirs.push((entry.name().to_string(), self.xxh.reset()))
@@ -781,13 +769,15 @@ impl<'handle> Iterator for DirHandleIter<'handle> {
     }
 }
 
+/* ######################################################################### */
+
 /**
 A sorted iterator over the entries in a directory.
 
 The lifetime parameter `'handle` is used to annotate that the entries
 in the Vec are only valid while the `DirHandle` object exists.
 */
-#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug)]
 pub struct DirHandleIterSorted<'handle>(EntryVec, PhantomData<&'handle DirHandle>);
 
 impl<'handle> Iterator for DirHandleIterSorted<'handle> {
@@ -796,4 +786,60 @@ impl<'handle> Iterator for DirHandleIterSorted<'handle> {
     fn next(&mut self) -> Option<Self::Item> {
         self.0.pop()
     }
+}
+
+/* ########################### UTILITY FUNCTIONS ########################### */
+
+/// Open a directory and return its handle.
+fn get_dir_handle(path: &Path) -> io::Result<Dir> {
+    Ok(Dir::open(path, OFlag::O_RDONLY, Mode::empty())?)
+}
+
+/// Open a file and return its handle.
+fn get_file_handle(path: &Path) -> io::Result<File> {
+    Ok(OpenOptions::new().read(true).open(path)?)
+}
+
+/// Return the state of a directory as a [DirectoryState] object.
+#[instrument(level = "trace", skip_all, ret)]
+fn directory_state(dir: &mut DirHandle) -> DirectoryState {
+    let (dirs, files) = dir.entries_sorted();
+    DirectoryState {
+        num_dirs: dirs.len(),
+        num_files: files.len(),
+        hash_dirs: dirs.xxh3_digest(),
+        hash_files: files.xxh3_digest(),
+        when: TimeSinceEpoch::new().into(),
+    }
+}
+
+/**
+Return the next entry from the inner [nix::dir::Iter] as an `EntryExt`,
+skipping `.` and `..`. Also skips entries where the file type cannot be
+determined (e.g. due to permission denied).
+*/
+#[instrument(level = "trace", skip(it))]
+fn next(it: &mut Peekable<Iter>, dirfd: RawFd) -> Option<EntryExt> {
+    it.filter_map(Result::ok)
+        .filter_map(|entry| {
+            // Sadly it appears that we cannot rely on the special "." and ".."
+            // entries being returned first by the libc `readdir` call, so to
+            // filter them out we must match each name.
+            if matches!(entry.file_name().to_bytes(), DOT1 | DOT2) {
+                return None;
+            }
+
+            // convert the [nix::dir::Entry] to our `EntryExt`
+            let entry: EntryExt = EntryExt::new(entry, dirfd);
+            if let Some(_) = entry.file_type() {
+                trace!(target: "name", "{:?} : {:?}", entry.name(), entry);
+                Some(entry)
+            } else {
+                // we ignore the entry if we can't determine its type
+                // (e.g. permission denied, unknown type)
+                trace!(target: "name", "{:?} : {:?} (skipping, no type)", entry.name(), entry);
+                return None;
+            }
+        })
+        .next()
 }
