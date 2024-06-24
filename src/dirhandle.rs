@@ -3,7 +3,7 @@
 #![allow(dead_code)]
 
 use crate::enhvec::EnhVec;
-use crate::hashing::{hash_item, CustomXxh3Hasher, Xxh3Hashable};
+use crate::hashing::{CustomXxh3Hasher, Xxh3Hashable};
 use crate::timesince::TimeSinceEpoch;
 use libc;
 use nix::{
@@ -210,6 +210,14 @@ impl EntryExt {
         }
     }
 
+    /// Return the file type of the entry as a `u8` typenum. Unknown is 254.
+    pub fn typenum(&self) -> u8 {
+        match self.file_type() {
+            Some(t) => t as u8,
+            None => 254,
+        }
+    }
+
     pub fn is_file(&self) -> bool {
         matches!(self.file_type(), Some(Type::File))
     }
@@ -254,6 +262,8 @@ impl Deref for EntryExt {
 
 impl Hash for EntryExt {
     #[inline]
+    /// NOTE: this method will **not** produce stable hashes due to the standard
+    /// `hash()` implementation's SipHash algorithm. Use `xxh3()` instead.
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.entry.hash(state);
         // TODO: should we hash the dirfd as well? If we do, we invalidate
@@ -265,11 +275,17 @@ impl Hash for EntryExt {
 
 impl Xxh3Hashable for EntryExt {
     fn xxh3<H: Hasher>(&self, state: &mut H) {
-        self.entry.hash(state);
+        state.write(self.name_as_bytes());
+        state.write_u64(self.entry.ino());
+        state.write_u8(self.typenum());
     }
 
     fn xxh3_digest(&self) -> u64 {
-        hash_item(&self.entry)
+        let mut hasher: CustomXxh3Hasher = CustomXxh3Hasher::default();
+        hasher.write(self.name_as_bytes());
+        hasher.write_u64(self.entry.ino());
+        hasher.write_u8(self.typenum());
+        hasher.finish()
     }
 }
 
@@ -606,10 +622,10 @@ pub struct DirHandleIter<'handle> {
     dirfd: RawFd,
     buf: BufDeque<EntryExt>,
     state: &'handle mut DirectoryState,
-    /// dir entry names and corresponding hashes
-    dirs: Vec<(String, u64)>,
-    /// file entry names and corresponding hashes
-    files: Vec<(String, u64)>,
+    /// clones of dir entries - used for hashing
+    dirs: EntryVec,
+    /// clones of file entries - used for hashing
+    files: EntryVec,
     /// resettable hasher for calculating entry hashes
     xxh: CustomXxh3Hasher,
     update: bool,
@@ -623,8 +639,8 @@ impl<'handle> DirHandleIter<'handle> {
             buf: BufDeque::default(),
             update: handle.state.when.is_none(),
             state: &mut handle.state,
-            dirs: Vec::new(),
-            files: Vec::new(),
+            dirs: EntryVec::new(),
+            files: EntryVec::new(),
             xxh: CustomXxh3Hasher::default(),
         }
     }
@@ -654,26 +670,22 @@ impl<'handle> DirHandleIter<'handle> {
     fn get_one(&mut self) -> Option<EntryExt> {
         if let Some(entry) = next(&mut self.inner, self.dirfd) {
             if self.update {
-                // store each entry name and its hash for later use
-                entry.hash(&mut self.xxh);
+                // store a clone of each entry for later use
+                let ec: EntryExt = entry.clone();
 
                 #[cfg(debug_assertions)]
                 {
-                    let tmp_hash = hash_item(&entry);
-                    let tmp_vec: EntryVec = EnhVec::new_from(vec![entry.clone()]);
-                    let vec_hash = hash_item(&tmp_vec);
+                    use crate::hashing::hash_item;
+                    ec.xxh3(&mut self.xxh);
+                    let vec: EntryVec = EnhVec::new_from(vec![entry.clone()]);
                     debug!(target: "get_one",
-                "{:?} : xxh_hash: {}, tmp_hash: {tmp_hash:?}, vec_hash: {vec_hash}, vec_xxh3: {}",
-                entry.name(), self.xxh.finish(), tmp_vec.xxh3_digest());
+                "{:?} : xxh3(entry): {}, vec_digest: {}, hash_item(entry): {}, hash_item(vec): {}",
+                entry.name(), self.xxh.reset(), vec.xxh3_digest(), hash_item(&entry), hash_item(&vec));
                 } // END DEBUG -- TODO: REMOVE
 
                 match entry.file_type() {
-                    Some(Type::Directory) => {
-                        self.dirs.push((entry.name().to_string(), self.xxh.reset()))
-                    }
-                    Some(_) => self
-                        .files
-                        .push((entry.name().to_string(), self.xxh.reset())),
+                    Some(Type::Directory) => self.dirs.push(ec),
+                    Some(_) => self.files.push(ec),
                     None => {} // unknown file type
                 }
             }
@@ -740,22 +752,19 @@ impl<'handle> Iterator for DirHandleIter<'handle> {
             } else if self.done() {
                 debug!(target: "DirHandleIter::next", "iter_done: {:?}", self.inner);
                 if self.update {
-                    // sort the data, use the hasher to build state from
-                    // precalculated values and then set DirHandle state
-                    self.dirs.sort_by(|a, b| a.0.cmp(&b.0));
-                    self.files.sort_by(|a, b| a.0.cmp(&b.0));
+                    // hash the sorted entries and set DirHandle state
                     self.state.num_dirs = self.dirs.len();
                     self.state.num_files = self.files.len();
                     self.state.when = TimeSinceEpoch::new().into();
 
                     self.xxh.reset(); // just in case...
-                    self.dirs.iter().for_each(|(_, hash)| {
-                        self.xxh.write_u64(*hash);
+                    self.dirs.as_sorted_asc().iter().for_each(|entry| {
+                        entry.xxh3(&mut self.xxh);
                     });
                     self.state.hash_dirs = self.xxh.reset();
 
-                    self.files.iter().for_each(|(_, hash)| {
-                        self.xxh.write_u64(*hash);
+                    self.files.as_sorted_asc().iter().for_each(|entry| {
+                        entry.xxh3(&mut self.xxh);
                     });
                     self.state.hash_files = self.xxh.reset();
 
