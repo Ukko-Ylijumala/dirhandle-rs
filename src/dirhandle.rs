@@ -403,7 +403,7 @@ following notable differences / enhancements:
   (relies on procfs being available and the inner Dir being open)
 - change detection in the directory (or parts therein) is facilitated by:
   - numbers of directories and files are cached
-  - hashes of directory and file entry names are cached
+  - (stable) hashes of directory and file entries are cached
 
 NOTE: the counts and hashes are updated when the directory is iterated for
 the first time, or when asked for explicitly, but they are **not** updated
@@ -470,7 +470,7 @@ impl DirHandle {
     - maintains a lookahead buffer to preferentially return directory
       entries before other entries (NOTE: not a guarantee)
     */
-    pub fn iter<'handle>(&'handle mut self) -> DirHandleIter<'handle> {
+    pub fn iter(&mut self) -> DirHandleIter {
         DirHandleIter::new(self)
     }
 
@@ -511,7 +511,7 @@ impl DirHandle {
     - returns directory entries before all other entries
     - sorts both entry lists alphabetically (separately)
     */
-    pub fn iter_sorted<'handle>(&'handle mut self) -> DirHandleIterSorted<'handle> {
+    pub fn iter_sorted(&mut self) -> DirHandleIterSorted {
         let (mut dirs, mut files) = self.entries(true, true);
 
         // NOTE: we sort in reverse order to pop the entries in alphabetical order
@@ -627,22 +627,29 @@ pub struct DirHandleIter<'handle> {
     /// clones of file entries - used for hashing
     files: EntryVec,
     /// resettable hasher for calculating entry hashes
-    xxh: CustomXxh3Hasher,
-    update: bool,
+    xxh: Option<CustomXxh3Hasher>,
 }
 
 impl<'handle> DirHandleIter<'handle> {
     pub fn new(handle: &'handle mut DirHandle) -> Self {
+        let update: bool = handle.state.when.is_none();
         Self {
             dirfd: handle.as_raw_fd(),
             inner: handle.inner.iter().peekable(),
             buf: BufDeque::default(),
-            update: handle.state.when.is_none(),
             state: &mut handle.state,
             dirs: EntryVec::new(),
             files: EntryVec::new(),
-            xxh: CustomXxh3Hasher::default(),
+            xxh: match update {
+                true => Some(CustomXxh3Hasher::default()),
+                false => None,
+            },
         }
+    }
+
+    /// Shall we update the [DirectoryState] struct after iter is done?
+    fn update(&mut self) -> bool {
+        self.xxh.is_some()
     }
 
     /// Is the inner iterator done?
@@ -669,18 +676,19 @@ impl<'handle> DirHandleIter<'handle> {
     /// Get one entry from the inner iterator.
     fn get_one(&mut self) -> Option<EntryExt> {
         if let Some(entry) = next(&mut self.inner, self.dirfd) {
-            if self.update {
+            if self.update() {
                 // store a clone of each entry for later use
                 let ec: EntryExt = entry.clone();
 
                 #[cfg(debug_assertions)]
                 {
                     use crate::hashing::hash_item;
-                    ec.xxh3(&mut self.xxh);
+                    let mut xxh: &mut CustomXxh3Hasher = self.xxh.as_mut().unwrap();
+                    ec.xxh3(&mut xxh);
                     let vec: EntryVec = EnhVec::new_from(vec![entry.clone()]);
                     debug!(target: "get_one",
                 "{:?} : xxh3(entry): {}, vec_digest: {}, hash_item(entry): {}, hash_item(vec): {}",
-                entry.name(), self.xxh.reset(), vec.xxh3_digest(), hash_item(&entry), hash_item(&vec));
+                entry.name(), xxh.reset(), vec.xxh3_digest(), hash_item(&entry), hash_item(&vec));
                 } // END DEBUG -- TODO: REMOVE
 
                 match entry.file_type() {
@@ -751,23 +759,24 @@ impl<'handle> Iterator for DirHandleIter<'handle> {
                 }
             } else if self.done() {
                 debug!(target: "DirHandleIter::next", "iter_done: {:?}", self.inner);
-                if self.update {
+                if self.update() {
                     // hash the sorted entries and set DirHandle state
+                    let mut xxh: CustomXxh3Hasher = self.xxh.take().unwrap();
+                    xxh.reset(); // just in case...
+
+                    self.dirs.as_sorted_asc().iter().for_each(|entry| {
+                        entry.xxh3(&mut xxh);
+                    });
+                    self.state.hash_dirs = xxh.reset();
+
+                    self.files.as_sorted_asc().iter().for_each(|entry| {
+                        entry.xxh3(&mut xxh);
+                    });
+                    self.state.hash_files = xxh.finish();
+
                     self.state.num_dirs = self.dirs.len();
                     self.state.num_files = self.files.len();
                     self.state.when = TimeSinceEpoch::new().into();
-
-                    self.xxh.reset(); // just in case...
-                    self.dirs.as_sorted_asc().iter().for_each(|entry| {
-                        entry.xxh3(&mut self.xxh);
-                    });
-                    self.state.hash_dirs = self.xxh.reset();
-
-                    self.files.as_sorted_asc().iter().for_each(|entry| {
-                        entry.xxh3(&mut self.xxh);
-                    });
-                    self.state.hash_files = self.xxh.reset();
-
                     trace!(target: "DirHandle.state", "{:?}", self.state);
                 }
                 return None;
