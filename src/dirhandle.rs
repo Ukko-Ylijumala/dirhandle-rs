@@ -5,6 +5,7 @@
 use crate::enhvec::EnhVec;
 use crate::hashing::{CustomXxh3Hasher, Xxh3Hashable};
 use crate::timesince::TimeSinceEpoch;
+use dashmap::{mapref::one::RefMut, DashMap};
 use libc;
 use nix::{
     dir::{Dir, Entry, Iter, Type},
@@ -22,6 +23,7 @@ use std::{
     ops::{Deref, DerefMut},
     os::fd::{AsRawFd, FromRawFd, RawFd},
     path::{Path, PathBuf},
+    rc::Rc,
     sync::OnceLock,
 };
 use tracing::{debug, instrument, trace, warn};
@@ -803,6 +805,112 @@ impl<'handle> Iterator for DirHandleIterSorted<'handle> {
 
     fn next(&mut self) -> Option<Self::Item> {
         self.0.pop()
+    }
+}
+
+/* ######################################################################### */
+
+/// A container for open directory handles ([DirHandle]s).
+pub struct OpenHandles(DashMap<RawFd, DirHandle>);
+
+impl OpenHandles {
+    pub fn new() -> Self {
+        Self(DashMap::new())
+    }
+
+    /// Whether we have such file descriptor.
+    pub fn contains(&self, fd: RawFd) -> bool {
+        self.0.contains_key(&fd)
+    }
+    /// Whether we have such handle. Slower than `contains(fd)`.
+    pub fn contains_handle(&self, handle: &DirHandle) -> bool {
+        self.0.iter().any(|entry| entry.value() == handle)
+    }
+
+    /// Check out a handle from the map. Only allows one borrow at a time due
+    /// to internally using `Dashmap::get_mut()`, which returns a [RefMut].
+    /// This is also thread-safe as DashMap (RefMut) is thread-safe due to its
+    /// internal locking using [parking_lot::RwLock].
+    fn checkout<'a>(&'a self, fd: RawFd) -> Option<CheckedOutHandle<'a>> {
+        let ref_handle: RefMut<'a, RawFd, DirHandle> = self.0.get_mut(&fd)?;
+        let close_callback = Rc::new(|fd: i32| {
+            self.close(fd);
+        });
+        Some(CheckedOutHandle {
+            inner: ref_handle,
+            close_callback,
+        })
+    }
+
+    /// Open a directory, insert its handle into the map and return it.
+    pub fn open(&self, path: &Path) -> io::Result<CheckedOutHandle> {
+        let handle: DirHandle = DirHandle::new(path)?;
+        let fd: RawFd = handle.as_raw_fd();
+        self.0.insert(fd, handle);
+        Ok(self.checkout(fd).unwrap())
+    }
+
+    /// Insert a handle into the map. Replaces an existing handle with the same
+    /// file descriptor, if present.
+    pub fn insert(&self, handle: DirHandle) {
+        self.0.insert(handle.as_raw_fd(), handle);
+    }
+
+    /// Get a [DirHandle] if we have it.
+    pub fn get(&self, fd: RawFd) -> Option<CheckedOutHandle> {
+        self.checkout(fd)
+    }
+
+    /// Remove a handle from the map if there are no other strong refs to it.
+    pub fn remove(&self, fd: RawFd) -> Option<DirHandle> {
+        self.0.remove(&fd).map(|(_, handle)| Some(handle))?
+    }
+
+    /// Close an open directory handle and release its file descriptor.
+    pub fn close(&self, fd: RawFd) {
+        self.0.remove(&fd);
+    }
+
+    /// Close all open directory handles (and release their file descriptors).
+    pub fn close_all(&self) {
+        self.0.clear();
+    }
+}
+
+/// An exclusively locked [DirHandle] from the [OpenHandles] container.
+///
+/// `CheckedOutHandle` implements [Deref] and [DerefMut] so you can use it
+/// as a `DirHandle` directly. In addition, it has a `close()` method which
+/// removes the `DirHandle` from parent `OpenHandles` (hence the directory
+/// handle is closed and its file descriptor released when dropped).
+pub struct CheckedOutHandle<'a> {
+    inner: RefMut<'a, RawFd, DirHandle>,
+    // Using Rc instead of Arc here is deliberate because we don't want to
+    // share the callback between threads and this also disallows moving a
+    // checked-out handle to another thread.
+    close_callback: Rc<dyn Fn(RawFd) + 'a>,
+}
+
+impl<'a> CheckedOutHandle<'a> {
+    /// Close this [DirHandle] and release its file descriptor.
+    pub fn close(self) {
+        let fd: i32 = *self.inner.key();
+        drop(self.inner); // explicitly drop the RefMut
+        (self.close_callback)(fd);
+    }
+}
+
+impl<'a> Deref for CheckedOutHandle<'a> {
+    type Target = DirHandle;
+
+    fn deref(&self) -> &Self::Target {
+        self.inner.value()
+    }
+}
+
+impl<'a> DerefMut for CheckedOutHandle<'a> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.inner.value_mut()
     }
 }
 
