@@ -12,6 +12,7 @@ use nix::{
     fcntl::{openat2, AtFlags, OFlag, OpenHow, ResolveFlag},
     sys::stat::{fstatat, Mode},
 };
+use std::fmt::Debug;
 use std::{
     cmp::Ordering,
     collections::VecDeque,
@@ -811,6 +812,7 @@ impl<'handle> Iterator for DirHandleIterSorted<'handle> {
 /* ######################################################################### */
 
 /// A container for open directory handles ([DirHandle]s).
+#[derive(Default, Debug)]
 pub struct OpenHandles(DashMap<RawFd, DirHandle>);
 
 impl OpenHandles {
@@ -911,6 +913,12 @@ impl<'a> Deref for CheckedOutHandle<'a> {
 impl<'a> DerefMut for CheckedOutHandle<'a> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.inner.value_mut()
+    }
+}
+
+impl Debug for CheckedOutHandle<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "CheckedOutHandle({:?})", self.inner)
     }
 }
 
