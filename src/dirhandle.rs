@@ -820,6 +820,10 @@ impl OpenHandles {
         Self(DashMap::new())
     }
 
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
     /// Whether we have such file descriptor.
     pub fn contains(&self, fd: RawFd) -> bool {
         self.0.contains_key(&fd)
