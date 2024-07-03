@@ -461,9 +461,32 @@ impl DirHandle {
         !changed.is_same()
     }
 
-    /// Return the inner [nix::dir::Iter] object and make it `Peekable`.
-    pub fn raw_iter<'handle>(&'handle mut self) -> Peekable<Iter<'handle>> {
+    /**
+    Return the inner [nix::dir::Iter] object and make it `Peekable`.
+
+    NOTE: this iterator will return the special `.` and `..` entries.
+
+    ## Safety
+    The returned `Iter` is **not** thread-safe and must **not** be sent to
+    another thread. It must be used only in the thread that created it.
+    */
+    pub unsafe fn raw_iter<'handle>(&'handle mut self) -> Peekable<Iter<'handle>> {
         self.inner.iter().peekable()
+    }
+
+    /**
+    Run a closure on each [nix::dir::Entry]. This allows lower-level but
+    safe access to the inner [nix::dir::Iter] iterator.
+
+    NOTE: the special `.` and `..` entries will be processed as well.
+    */
+    pub fn for_each<F>(&mut self, mut f: F)
+    where
+        F: FnMut(&Entry),
+    {
+        self.inner.iter().filter_map(Result::ok).for_each(|entry: Entry| {
+            f(&entry);
+        });
     }
 
     /**
