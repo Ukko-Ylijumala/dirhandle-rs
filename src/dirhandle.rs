@@ -484,9 +484,12 @@ impl DirHandle {
     where
         F: FnMut(&Entry),
     {
-        self.inner.iter().filter_map(Result::ok).for_each(|entry: Entry| {
-            f(&entry);
-        });
+        self.inner
+            .iter()
+            .filter_map(Result::ok)
+            .for_each(|entry: Entry| {
+                f(&entry);
+            });
     }
 
     /**
@@ -865,12 +868,11 @@ impl OpenHandles {
     /// internal locking using [parking_lot::RwLock].
     fn checkout<'a>(&'a self, fd: RawFd) -> Option<CheckedOutHandle<'a>> {
         let ref_handle: RefMut<'a, RawFd, DirHandle> = self.0.get_mut(&fd)?;
-        let close_callback = Rc::new(|fd: i32| {
-            self.close(fd);
-        });
         Some(CheckedOutHandle {
             inner: ref_handle,
-            close_callback,
+            close_callback: Rc::new(|fd: i32| {
+                self.close(fd);
+            }),
         })
     }
 
