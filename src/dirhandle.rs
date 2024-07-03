@@ -840,7 +840,15 @@ impl<'handle> Iterator for DirHandleIterSorted<'handle> {
 
 /* ######################################################################### */
 
-/// A container for open directory handles ([DirHandle]s).
+/**
+A container for open directory handles ([DirHandle]s).
+
+Thread-safe due to the inner [DashMap] being thread-safe.
+
+**NOTE**: trying to check out more than 1 handle at a time from the same thread
+(aka. holding more than one reference into OpenHandles) may lead to a deadlock
+due to the internal locking of DashMap. You have been warned.
+*/
 #[derive(Default, Debug)]
 pub struct OpenHandles(DashMap<RawFd, DirHandle>);
 
@@ -863,7 +871,7 @@ impl OpenHandles {
     }
 
     /// Check out a handle from the map. Only allows one borrow at a time due
-    /// to internally using `Dashmap::get_mut()`, which returns a [RefMut].
+    /// to internally using [DashMap::get_mut], which returns a [RefMut].
     /// This is also thread-safe as DashMap (RefMut) is thread-safe due to its
     /// internal locking using [parking_lot::RwLock].
     fn checkout<'a>(&'a self, fd: RawFd) -> Option<CheckedOutHandle<'a>> {
@@ -876,7 +884,12 @@ impl OpenHandles {
         })
     }
 
-    /// Open a directory, insert its handle into the map and return it.
+    /**
+    Open a directory, insert its handle into the map and return it.
+
+    **NOTE**: may deadlock if called while holding any kind of reference
+    into this [OpenHandles] in the same thread.
+    */
     pub fn open(&self, path: &Path) -> io::Result<CheckedOutHandle> {
         let handle: DirHandle = DirHandle::new(path)?;
         let fd: RawFd = handle.as_raw_fd();
@@ -890,7 +903,12 @@ impl OpenHandles {
         self.0.insert(handle.as_raw_fd(), handle);
     }
 
-    /// Get a [DirHandle] if we have it.
+    /**
+    Get a [DirHandle] if we have it.
+
+    **NOTE**: may deadlock if called while holding any kind of reference
+    into this [OpenHandles] in the same thread.
+    */
     pub fn get(&self, fd: RawFd) -> Option<CheckedOutHandle> {
         self.checkout(fd)
     }
@@ -908,6 +926,36 @@ impl OpenHandles {
     /// Close all open directory handles (and release their file descriptors).
     pub fn close_all(&self) {
         self.0.clear();
+    }
+
+    /**
+    Run a closure on each [DirHandle] in random order.
+
+    **NOTE**: may deadlock if called while holding a mutable reference
+    into this [OpenHandles] in the same thread.
+    */
+    pub fn for_each<F>(&self, mut f: F)
+    where
+        F: FnMut(&DirHandle),
+    {
+        self.0.iter().for_each(|item| {
+            f(item.value());
+        });
+    }
+
+    /**
+    Run a mutating closure on each [DirHandle] in random order.
+
+    **NOTE**: may deadlock if called while holding any kind of reference
+    into this [OpenHandles] in the same thread.
+    */
+    pub fn for_each_mut<F>(&self, mut f: F)
+    where
+        F: FnMut(&mut DirHandle),
+    {
+        self.0.iter_mut().for_each(|mut item| {
+            f(item.value_mut());
+        });
     }
 }
 
