@@ -574,6 +574,9 @@ impl AsRawFd for DirHandle {
     }
 }
 
+// DirHandle can be Send, since the underlying nix::dir::Dir is Send as well.
+unsafe impl Send for DirHandle {}
+
 /* ######################################################################### */
 
 /**
@@ -905,6 +908,9 @@ impl OpenHandles {
         self.0.clear();
     }
 }
+
+// OpenHandles is thread-safe due to the internal DashMap being thread-safe.
+unsafe impl Sync for OpenHandles {}
 
 /// An exclusively locked [DirHandle] from the [OpenHandles] container.
 ///
