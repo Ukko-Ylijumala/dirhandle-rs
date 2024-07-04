@@ -2,6 +2,7 @@
 
 #![allow(dead_code)]
 
+use super::{ToDebug, ToDisplay};
 use crate::enhvec::EnhVec;
 use crate::hashing::{CustomXxh3Hasher, Xxh3Hashable};
 use crate::timesince::TimeSinceEpoch;
@@ -12,10 +13,10 @@ use nix::{
     fcntl::{openat2, AtFlags, OFlag, OpenHow, ResolveFlag},
     sys::stat::{fstatat, Mode},
 };
-use std::fmt::Debug;
 use std::{
     cmp::Ordering,
     collections::VecDeque,
+    fmt::{self, Debug, Display, Formatter},
     fs::{read_link, File, OpenOptions},
     hash::{Hash, Hasher},
     io,
@@ -297,19 +298,19 @@ impl Xxh3Hashable for EntryExt {
 /**
 The type of change detected in a directory, if any.
 
-`DirectoryNum` or `FileNum` change also implies a change of `DirectoryHash`
-or `FileHash`, respectively, but the reverse is not true. But since we first
-check for `DirectoryNum` and `FileNum` changes, that doesn't matter.
+`DirNum` or `FileNum` change also implies a change of `DirHash` or `FileHash`,
+respectively, but the reverse is not true. But since we first check for
+`DirNum` and `FileNum` changes, that doesn't matter.
 */
 #[derive(Debug)]
 pub enum StateChange {
     Unchanged,
     /// Directory count change (positive or negative)
-    DirectoryNum(i32),
+    DirNum(i32),
     /// File count change (positive or negative)
     FileNum(i32),
     /// Same directory count, but hash of dir entries has changed
-    DirectoryHash,
+    DirHash,
     /// Same file count, but hash of file entries has changed
     FileHash,
 }
@@ -326,12 +327,11 @@ impl StateChange {
 /* --------------------------------- */
 
 /// This struct holds the state of a directory for change detection.
-#[derive(Debug)]
 pub struct DirectoryState {
-    num_dirs: usize,
-    num_files: usize,
-    hash_dirs: u64,
-    hash_files: u64,
+    dirs: usize,
+    files: usize,
+    hash_d: u64,
+    hash_f: u64,
     when: Option<TimeSinceEpoch>,
 }
 
@@ -345,17 +345,19 @@ impl DirectoryState {
     }
 
     /// Compare two states and return the type of change as a [StateChange] enum.
-    pub fn change_type(&self, other: &Self) -> StateChange {
-        if self.num_dirs != other.num_dirs {
-            return StateChange::DirectoryNum(self.num_dirs as i32 - other.num_dirs as i32);
+    /// First change seen is returned, so `DirNum` or `FileNum` change implies
+    /// a `DirHash` or `FileHash` change, respectively.
+    pub fn change(&self, other: &Self) -> StateChange {
+        if self.dirs != other.dirs {
+            return StateChange::DirNum(self.dirs as i32 - other.dirs as i32);
         }
-        if self.num_files != other.num_files {
-            return StateChange::FileNum(self.num_files as i32 - other.num_files as i32);
+        if self.files != other.files {
+            return StateChange::FileNum(self.files as i32 - other.files as i32);
         }
-        if self.hash_dirs != other.hash_dirs {
-            return StateChange::DirectoryHash;
+        if self.hash_d != other.hash_d {
+            return StateChange::DirHash;
         }
-        if self.hash_files != other.hash_files {
+        if self.hash_f != other.hash_f {
             return StateChange::FileHash;
         }
         StateChange::Unchanged
@@ -363,17 +365,17 @@ impl DirectoryState {
 
     /// Combined hash of directory and file entry hashes.
     pub fn hash_all(&self) -> u64 {
-        self.hash_dirs.rotate_left(32) ^ self.hash_files
+        self.hash_d.rotate_left(32) ^ self.hash_f
     }
 }
 
 impl Default for DirectoryState {
     fn default() -> Self {
         Self {
-            num_dirs: 0,
-            num_files: 0,
-            hash_dirs: 0,
-            hash_files: 0,
+            dirs: 0,
+            files: 0,
+            hash_d: 0,
+            hash_f: 0,
             when: None,
         }
     }
@@ -383,10 +385,42 @@ impl Eq for DirectoryState {}
 
 impl PartialEq for DirectoryState {
     fn eq(&self, other: &Self) -> bool {
-        self.num_dirs == other.num_dirs
-            && self.num_files == other.num_files
-            && self.hash_dirs == other.hash_dirs
-            && self.hash_files == other.hash_files
+        self.dirs == other.dirs
+            && self.files == other.files
+            && self.hash_d == other.hash_d
+            && self.hash_f == other.hash_f
+    }
+}
+
+impl Debug for DirectoryState {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        write!(
+            f,
+            "DirectoryState {{ dirs: {d}, files: {f}, hash_d: 0x{hd:x}, hash_f: 0x{hf:x}, when: {w} }}",
+            d = self.dirs,
+            f = self.files,
+            hd = self.hash_d,
+            hf = self.hash_f,
+            w = match &self.when {
+                Some(t) => t.to_debug(),
+                None => "<uninit>".to_string(),
+            },
+        )
+    }
+}
+
+impl Display for DirectoryState {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        write!(
+            f,
+            "DirectoryState {{ dirs: {d}, files: {f} ({w}) }}",
+            d = self.dirs,
+            f = self.files,
+            w = match &self.when {
+                Some(t) => t.to_display(),
+                None => "<uninit>".to_string(),
+            },
+        )
     }
 }
 
@@ -456,7 +490,7 @@ impl DirHandle {
     /// Whether the state has changed. Also updates the stored state if so.
     pub fn state_changed(&mut self) -> bool {
         let current: DirectoryState = self.state_current();
-        let changed: StateChange = self.state.change_type(&current);
+        let changed: StateChange = self.state.change(&current);
         self.state.update(current);
         !changed.is_same()
     }
@@ -719,7 +753,7 @@ impl<'handle> DirHandleIter<'handle> {
                     ec.xxh3(&mut xxh);
                     let vec: EntryVec = EnhVec::new_from(vec![entry.clone()]);
                     debug!(target: "get_one",
-                "{:?} : xxh3(entry): {}, vec_digest: {}, hash_item(entry): {}, hash_item(vec): {}",
+                "{:?} : xxh3(entry): 0x{:x}, vec_digest: 0x{:x}, hash_item(entry): 0x{:x}, hash_item(vec): 0x{:x}",
                 entry.name(), xxh.reset(), vec.xxh3_digest(), hash_item(&entry), hash_item(&vec));
                 } // END DEBUG -- TODO: REMOVE
 
@@ -799,15 +833,15 @@ impl<'handle> Iterator for DirHandleIter<'handle> {
                     self.dirs.as_sorted_asc().iter().for_each(|entry| {
                         entry.xxh3(&mut xxh);
                     });
-                    self.state.hash_dirs = xxh.reset();
+                    self.state.hash_d = xxh.reset();
 
                     self.files.as_sorted_asc().iter().for_each(|entry| {
                         entry.xxh3(&mut xxh);
                     });
-                    self.state.hash_files = xxh.finish();
+                    self.state.hash_f = xxh.finish();
 
-                    self.state.num_dirs = self.dirs.len();
-                    self.state.num_files = self.files.len();
+                    self.state.dirs = self.dirs.len();
+                    self.state.files = self.files.len();
                     self.state.when = TimeSinceEpoch::new().into();
                     trace!(target: "DirHandle.state", "{:?}", self.state);
                 }
@@ -1022,10 +1056,10 @@ fn get_file_handle(path: &Path) -> io::Result<File> {
 fn directory_state(dir: &mut DirHandle) -> DirectoryState {
     let (dirs, files) = dir.entries_sorted();
     DirectoryState {
-        num_dirs: dirs.len(),
-        num_files: files.len(),
-        hash_dirs: dirs.xxh3_digest(),
-        hash_files: files.xxh3_digest(),
+        dirs: dirs.len(),
+        files: files.len(),
+        hash_d: dirs.xxh3_digest(),
+        hash_f: files.xxh3_digest(),
         when: TimeSinceEpoch::new().into(),
     }
 }
