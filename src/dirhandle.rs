@@ -112,6 +112,7 @@ pub struct EntryExt {
 }
 
 impl EntryExt {
+    /// Create an `EntryExt` from a given [Entry] and its parent directory fd.
     #[instrument(level = "trace")]
     pub fn new(entry: Entry, dirfd: i32) -> Self {
         Self {
@@ -119,6 +120,13 @@ impl EntryExt {
             dirfd,
             stat: OnceLock::new(),
         }
+    }
+
+    /// Create a new `EntryExt` and also `stat()` it before returning it.
+    pub fn new_statted(entry: Entry, dirfd: i32) -> Self {
+        let new_e: EntryExt = Self::new(entry, dirfd);
+        new_e.stat();
+        new_e
     }
 
     /**
@@ -139,6 +147,11 @@ impl EntryExt {
     pub fn stat_refresh(&mut self) -> Option<libc::stat> {
         self.stat.take();
         self.stat()
+    }
+
+    /// Whether the entry has been statted.
+    pub fn is_statted(&self) -> bool {
+        self.stat.get().is_some()
     }
 
     /**
@@ -222,14 +235,33 @@ impl EntryExt {
         }
     }
 
+    #[inline]
     pub fn is_file(&self) -> bool {
         matches!(self.file_type(), Some(Type::File))
     }
+    #[inline]
     pub fn is_dir(&self) -> bool {
         matches!(self.file_type(), Some(Type::Directory))
     }
+    #[inline]
     pub fn is_symlink(&self) -> bool {
         matches!(self.file_type(), Some(Type::Symlink))
+    }
+    #[inline]
+    pub fn is_block(&self) -> bool {
+        matches!(self.file_type(), Some(Type::BlockDevice))
+    }
+    #[inline]
+    pub fn is_char(&self) -> bool {
+        matches!(self.file_type(), Some(Type::CharacterDevice))
+    }
+    #[inline]
+    pub fn is_sock(&self) -> bool {
+        matches!(self.file_type(), Some(Type::Socket))
+    }
+    #[inline]
+    pub fn is_fifo(&self) -> bool {
+        matches!(self.file_type(), Some(Type::Fifo))
     }
 }
 
@@ -327,6 +359,7 @@ impl StateChange {
 /* --------------------------------- */
 
 /// This struct holds the state of a directory for change detection.
+#[derive(Clone, Hash)]
 pub struct DirectoryState {
     dirs: usize,
     files: usize,
@@ -446,7 +479,7 @@ NOTE: the counts and hashes are updated when the directory is iterated for
 the first time, or when asked for explicitly, but they are **not** updated
 automatically if the directory is changed externally.
 
-NOTE: the [DirHandle] object is not thread-safe, and it is not intended
+NOTE: the [DirHandle] object is not thread-safe and it is not intended
 to be shared between threads, see the following `readdir` manual:
 https://www.gnu.org/software/libc/manual/html_node/Reading_002fClosing-Directory.html
 
@@ -534,7 +567,12 @@ impl DirHandle {
       entries before other entries (NOTE: not a guarantee)
     */
     pub fn iter(&mut self) -> DirHandleIter {
-        DirHandleIter::new(self)
+        DirHandleIter::new(self, false)
+    }
+
+    /// Same as `iter()`, but also explicitly `stat()`s each entry.
+    pub fn iter_stat(&mut self) -> DirHandleIter {
+        DirHandleIter::new(self, true)
     }
 
     /// Return the directory entries as a tuple of directories and files.
@@ -563,8 +601,8 @@ impl DirHandle {
     /// Return the directory entries as sorted tuples of directories and files.
     pub fn entries_sorted<'handle>(&'handle mut self) -> (EntryVec, EntryVec) {
         let (mut dirs, mut files) = self.entries(true, true);
-        dirs.sort_by(|a, b| a.cmp(b));
-        files.sort_by(|a, b| a.cmp(b));
+        dirs.sort_by(|a: &EntryExt, b: &EntryExt| a.cmp(b));
+        files.sort_by(|a: &EntryExt, b: &EntryExt| a.cmp(b));
         (dirs, files)
     }
 
@@ -578,8 +616,8 @@ impl DirHandle {
         let (mut dirs, mut files) = self.entries(true, true);
 
         // NOTE: we sort in reverse order to pop the entries in alphabetical order
-        dirs.sort_by(|a, b| b.cmp(a));
-        files.sort_by(|a, b| b.cmp(a));
+        dirs.sort_by(|a: &EntryExt, b: &EntryExt| b.cmp(a));
+        files.sort_by(|a: &EntryExt, b: &EntryExt| b.cmp(a));
         files.extend_from_slice(&dirs);
         DirHandleIterSorted(files, PhantomData)
     }
@@ -603,8 +641,8 @@ impl PartialEq for DirHandle {
 
 impl AsRawFd for DirHandle {
     /**
-    The file descriptor continues to be owned by the `DirHandle`, so
-    callers must not keep a `RawFd` after the `DirHandle` is dropped.
+    The file descriptor continues to be owned by the [DirHandle], so
+    callers must not keep a [RawFd] after the `DirHandle` is dropped.
     */
     fn as_raw_fd(&self) -> RawFd {
         self.inner.as_raw_fd()
@@ -639,7 +677,7 @@ impl BufDeque<EntryExt> {
 
     /// Any directory entries in the buffer?
     pub fn has_dir(&self) -> bool {
-        self.iter().any(|entry| entry.is_dir())
+        self.iter().any(|entry: &EntryExt| entry.is_dir())
     }
 
     /**
@@ -651,8 +689,8 @@ impl BufDeque<EntryExt> {
             return None;
         }
         self.iter()
-            .position(|entry| entry.is_dir())
-            .map(|idx| self.remove(idx))
+            .position(|entry: &EntryExt| entry.is_dir())
+            .map(|idx: usize| self.remove(idx))
             .unwrap_or_else(|| self.pop_front())
     }
 }
@@ -688,6 +726,7 @@ pub struct DirHandleIter<'handle> {
     dirfd: RawFd,
     buf: BufDeque<EntryExt>,
     state: &'handle mut DirectoryState,
+    stat: bool,
     /// clones of dir entries - used for hashing
     dirs: EntryVec,
     /// clones of file entries - used for hashing
@@ -697,13 +736,14 @@ pub struct DirHandleIter<'handle> {
 }
 
 impl<'handle> DirHandleIter<'handle> {
-    pub fn new(handle: &'handle mut DirHandle) -> Self {
+    pub fn new(handle: &'handle mut DirHandle, stat: bool) -> Self {
         let update: bool = handle.state.when.is_none();
         Self {
             dirfd: handle.as_raw_fd(),
             inner: handle.inner.iter().peekable(),
             buf: BufDeque::default(),
             state: &mut handle.state,
+            stat,
             dirs: EntryVec::new(),
             files: EntryVec::new(),
             xxh: match update {
@@ -741,7 +781,7 @@ impl<'handle> DirHandleIter<'handle> {
 
     /// Get one entry from the inner iterator.
     fn get_one(&mut self) -> Option<EntryExt> {
-        if let Some(entry) = next(&mut self.inner, self.dirfd) {
+        if let Some(entry) = next(&mut self.inner, self.dirfd, self.stat) {
             if self.update() {
                 // store a clone of each entry for later use
                 let ec: EntryExt = entry.clone();
@@ -755,7 +795,7 @@ impl<'handle> DirHandleIter<'handle> {
                     debug!(target: "get_one",
                 "{:?} : xxh3(entry): 0x{:x}, vec_digest: 0x{:x}, hash_item(entry): 0x{:x}, hash_item(vec): 0x{:x}",
                 entry.name(), xxh.reset(), vec.xxh3_digest(), hash_item(&entry), hash_item(&vec));
-                } // END DEBUG -- TODO: REMOVE
+                } // END DEBUG
 
                 match entry.file_type() {
                     Some(Type::Directory) => self.dirs.push(ec),
@@ -859,7 +899,7 @@ impl<'handle> Iterator for DirHandleIter<'handle> {
 A sorted iterator over the entries in a directory.
 
 The lifetime parameter `'handle` is used to annotate that the entries
-in the Vec are only valid while the `DirHandle` object exists.
+in the Vec are only valid while the parent [DirHandle] object exists.
 */
 #[derive(Debug)]
 pub struct DirHandleIterSorted<'handle>(EntryVec, PhantomData<&'handle DirHandle>);
@@ -880,8 +920,8 @@ A container for open directory handles ([DirHandle]s).
 Thread-safe due to the inner [DashMap] being thread-safe.
 
 **NOTE**: trying to check out more than 1 handle at a time from the same thread
-(aka. holding more than one reference into OpenHandles) may lead to a deadlock
-due to the internal locking of DashMap. You have been warned.
+(aka. holding more than one reference into `OpenHandles`) may lead to a deadlock
+due to the internal locking of `DashMap`. You have been warned.
 */
 #[derive(Default, Debug)]
 pub struct OpenHandles(DashMap<RawFd, DirHandle>);
@@ -1004,7 +1044,7 @@ unsafe impl Sync for OpenHandles {}
 /// handle is closed and its file descriptor released when dropped).
 pub struct CheckedOutHandle<'a> {
     inner: RefMut<'a, RawFd, DirHandle>,
-    // Using Rc instead of Arc here is deliberate because we don't want to
+    // Using `Rc` instead of `Arc` here is deliberate because we don't want to
     // share the callback between threads and this also disallows moving a
     // checked-out handle to another thread.
     close_callback: Rc<dyn Fn(RawFd) + 'a>,
@@ -1034,7 +1074,7 @@ impl<'a> DerefMut for CheckedOutHandle<'a> {
 }
 
 impl Debug for CheckedOutHandle<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         write!(f, "CheckedOutHandle({:?})", self.inner)
     }
 }
@@ -1065,12 +1105,14 @@ fn directory_state(dir: &mut DirHandle) -> DirectoryState {
 }
 
 /**
-Return the next entry from the inner [nix::dir::Iter] as an `EntryExt`,
+Return the next entry from the inner [nix::dir::Iter] as an [EntryExt],
 skipping `.` and `..`. Also skips entries where the file type cannot be
 determined (e.g. due to permission denied).
+
+If `stat == true`, we also `stat()` the entry before returning it.
 */
 #[instrument(level = "trace", skip(it))]
-fn next(it: &mut Peekable<Iter>, dirfd: RawFd) -> Option<EntryExt> {
+fn next(it: &mut Peekable<Iter>, dirfd: RawFd, stat: bool) -> Option<EntryExt> {
     it.filter_map(Result::ok)
         .filter_map(|entry| {
             // Sadly it appears that we cannot rely on the special "." and ".."
@@ -1081,7 +1123,10 @@ fn next(it: &mut Peekable<Iter>, dirfd: RawFd) -> Option<EntryExt> {
             }
 
             // convert the [nix::dir::Entry] to our `EntryExt`
-            let entry: EntryExt = EntryExt::new(entry, dirfd);
+            let entry: EntryExt = match stat {
+                false => EntryExt::new(entry, dirfd),
+                true => EntryExt::new_statted(entry, dirfd),
+            };
             if let Some(_) = entry.file_type() {
                 trace!(target: "name", "{:?} : {:?}", entry.name(), entry);
                 Some(entry)
