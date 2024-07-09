@@ -14,7 +14,7 @@ use nix::{
     sys::stat::{fstatat, Mode},
 };
 use std::{
-    cmp::Ordering,
+    cmp::{Eq, Ordering, PartialEq, PartialOrd, Ord},
     collections::VecDeque,
     fmt::{self, Debug, Display, Formatter},
     fs::{read_link, File, OpenOptions},
@@ -26,7 +26,10 @@ use std::{
     os::fd::{AsRawFd, FromRawFd, RawFd},
     path::{Path, PathBuf},
     rc::Rc,
-    sync::OnceLock,
+    sync::{
+        atomic::{AtomicI32, Ordering::Relaxed},
+        OnceLock,
+    },
 };
 use tracing::{debug, instrument, trace, warn};
 
@@ -91,6 +94,135 @@ impl EntryType {
     }
 }
 
+/// A thin wrapper around a [[RawFd]] with some extra functionality.
+///
+/// Notably, a [DirFd] can resolve its path from the file descriptor, and a
+/// negative value indicates that the file descriptor used to be open.
+///
+/// Due to internally using an [AtomicI32], it is thread-safe.
+///
+/// Mapping:
+/// - `DirFd > 0` : This is an open handle with this file descriptor.
+/// - `DirFd == 0` : Uninitialized.
+/// - `DirFd < 0` : We had an open handle as `abs(DirFd)`, but it was closed.
+#[derive(Debug)]
+pub struct DirFd(AtomicI32);
+
+impl DirFd {
+    pub fn new(fd: RawFd) -> Self {
+        DirFd(fd.into())
+    }
+
+    /// Returns the file descriptor.
+    #[inline]
+    pub fn fd(&self) -> RawFd {
+        self.0.load(Relaxed)
+    }
+
+    /// Whether the file descriptor is open.
+    pub fn is_open(&self) -> bool {
+        self.fd() > 0
+    }
+
+    /// Set the inner file descriptor.
+    ///
+    /// Returns the file descriptor if it was set successfully.
+    /// If the fd is already set, returns an error with the existing fd.
+    /// In the latter case, the caller should clear the existing fd first.
+    pub fn set(&self, fd: RawFd) -> Result<RawFd, RawFd> {
+        let current: i32 = self.fd();
+        if current > 0 {
+            return Err(current);
+        }
+        self.0.store(fd, Relaxed);
+        Ok(fd)
+    }
+
+    /// Clear the file descriptor.
+    ///
+    /// If the fd is set, we "store" the negative value of the fd.
+    /// If the fd is already cleared (negative), we set it to 0.
+    pub fn clear(&self) {
+        let current: i32 = self.fd();
+        if current > 0 {
+            self.0.store(-current, Relaxed);
+        } else {
+            self.0.store(0, Relaxed);
+        }
+    }
+
+    /**
+    This relies on proc filesystem being available due to the use of
+    `/proc/self/fd` to resolve the path from the file descriptor.
+    */
+    pub fn path(&self) -> io::Result<PathBuf> {
+        if self.fd() < 1 {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "No such file descriptor"));
+        }
+        read_link(format!("/proc/self/fd/{}", self.fd()))
+    }
+}
+
+impl Clone for DirFd {
+    fn clone(&self) -> Self {
+        DirFd(self.fd().into())
+    }
+}
+
+impl Default for DirFd {
+    fn default() -> Self {
+        DirFd(0.into())
+    }
+}
+
+impl PartialOrd for DirFd {
+    #[inline]
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        self.fd().partial_cmp(&other.fd())
+    }
+}
+
+impl Ord for DirFd {
+    #[inline]
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.fd().cmp(&other.fd())
+    }
+}
+
+impl PartialEq for DirFd {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        self.fd() == other.fd()
+    }
+}
+
+impl Eq for DirFd {}
+
+impl Hash for DirFd {
+    #[inline]
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.fd().hash(state);
+    }
+}
+
+impl AsRawFd for DirFd {
+    fn as_raw_fd(&self) -> RawFd {
+        self.fd()
+    }
+}
+
+impl From<RawFd> for DirFd {
+    fn from(fd: RawFd) -> Self {
+        DirFd(fd.into())
+    }
+}
+
+impl From<&DirFd> for RawFd {
+    fn from(dirfd: &DirFd) -> Self {
+        dirfd.fd()
+    }
+}
+
 /* ######################################################################### */
 
 /**
@@ -107,14 +239,14 @@ Notable differences:
 #[derive(Debug, Eq, Clone)]
 pub struct EntryExt {
     entry: Entry,
-    dirfd: i32,
+    dirfd: DirFd,
     stat: OnceLock<Option<libc::stat>>,
 }
 
 impl EntryExt {
     /// Create an `EntryExt` from a given [Entry] and its parent directory fd.
     #[instrument(level = "trace")]
-    pub fn new(entry: Entry, dirfd: i32) -> Self {
+    pub fn new(entry: Entry, dirfd: DirFd) -> Self {
         Self {
             entry,
             dirfd,
@@ -123,7 +255,7 @@ impl EntryExt {
     }
 
     /// Create a new `EntryExt` and also `stat()` it before returning it.
-    pub fn new_statted(entry: Entry, dirfd: i32) -> Self {
+    pub fn new_statted(entry: Entry, dirfd: DirFd) -> Self {
         let new_e: EntryExt = Self::new(entry, dirfd);
         new_e.stat();
         new_e
@@ -136,7 +268,7 @@ impl EntryExt {
     */
     pub fn stat(&self) -> Option<libc::stat> {
         *self.stat.get_or_init(|| {
-            match fstatat(Some(self.dirfd), self.file_name(), AtFlags::AT_SYMLINK_NOFOLLOW) {
+            match fstatat(Some(self.dirfd.fd()), self.file_name(), AtFlags::AT_SYMLINK_NOFOLLOW) {
                 Ok(stat) => Some(stat),
                 Err(_) => None,
             }
@@ -181,7 +313,7 @@ impl EntryExt {
         let open_how: OpenHow = OpenHow::new()
             .flags(flags)
             .resolve(ResolveFlag::RESOLVE_BENEATH);
-        let fd: i32 = openat2(self.dirfd, self.file_name(), open_how)?;
+        let fd: i32 = openat2(self.dirfd.fd(), self.file_name(), open_how)?;
         Ok(unsafe { File::from_raw_fd(fd) })
     }
 
@@ -209,7 +341,7 @@ impl EntryExt {
     `/proc/self/fd` to resolve the parent directory by file descriptor.
     */
     pub fn path(&self) -> io::Result<PathBuf> {
-        match read_link(format!("/proc/self/fd/{}", self.dirfd)) {
+        match self.dirfd.path() {
             Ok(link) => Ok(link.join(self.name())),
             Err(e) => Err(e),
         }
@@ -502,12 +634,17 @@ impl DirHandle {
         })
     }
 
+    /// Our file descriptor as a [DirFd] object.
+    pub fn fd(&self) -> DirFd {
+        self.inner.as_raw_fd().into()
+    }
+
     /**
     This relies on proc filesystem being available due to the use of
     `/proc/self/fd` to resolve the path by file descriptor.
     */
     pub fn path(&self) -> io::Result<PathBuf> {
-        Ok(read_link(format!("/proc/self/fd/{}", self.as_raw_fd()))?)
+        Ok(self.fd().path()?)
     }
 
     /// Stored state of the directory as a [DirectoryState] object.
@@ -723,7 +860,7 @@ impl<T> DerefMut for BufDeque<T> {
 #[derive(Debug)]
 pub struct DirHandleIter<'handle> {
     inner: Peekable<Iter<'handle>>,
-    dirfd: RawFd,
+    dirfd: DirFd,
     buf: BufDeque<EntryExt>,
     state: &'handle mut DirectoryState,
     stat: bool,
@@ -739,7 +876,7 @@ impl<'handle> DirHandleIter<'handle> {
     pub fn new(handle: &'handle mut DirHandle, stat: bool) -> Self {
         let update: bool = handle.state.when.is_none();
         Self {
-            dirfd: handle.as_raw_fd(),
+            dirfd: handle.fd(),
             inner: handle.inner.iter().peekable(),
             buf: BufDeque::default(),
             state: &mut handle.state,
@@ -781,7 +918,7 @@ impl<'handle> DirHandleIter<'handle> {
 
     /// Get one entry from the inner iterator.
     fn get_one(&mut self) -> Option<EntryExt> {
-        if let Some(entry) = next(&mut self.inner, self.dirfd, self.stat) {
+        if let Some(entry) = next(&mut self.inner, &self.dirfd, self.stat) {
             if self.update() {
                 // store a clone of each entry for later use
                 let ec: EntryExt = entry.clone();
@@ -1112,7 +1249,7 @@ determined (e.g. due to permission denied).
 If `stat == true`, we also `stat()` the entry before returning it.
 */
 #[instrument(level = "trace", skip(it))]
-fn next(it: &mut Peekable<Iter>, dirfd: RawFd, stat: bool) -> Option<EntryExt> {
+fn next(it: &mut Peekable<Iter>, dirfd: &DirFd, stat: bool) -> Option<EntryExt> {
     it.filter_map(Result::ok)
         .filter_map(|entry| {
             // Sadly it appears that we cannot rely on the special "." and ".."
@@ -1124,8 +1261,8 @@ fn next(it: &mut Peekable<Iter>, dirfd: RawFd, stat: bool) -> Option<EntryExt> {
 
             // convert the [nix::dir::Entry] to our `EntryExt`
             let entry: EntryExt = match stat {
-                false => EntryExt::new(entry, dirfd),
-                true => EntryExt::new_statted(entry, dirfd),
+                false => EntryExt::new(entry, dirfd.clone()),
+                true => EntryExt::new_statted(entry, dirfd.clone()),
             };
             if let Some(_) = entry.file_type() {
                 trace!(target: "name", "{:?} : {:?}", entry.name(), entry);
