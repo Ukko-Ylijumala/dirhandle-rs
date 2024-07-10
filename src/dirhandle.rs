@@ -94,17 +94,19 @@ impl EntryType {
     }
 }
 
-/// A thin wrapper around a [[RawFd]] with some extra functionality.
-///
-/// Notably, a [DirFd] can resolve its path from the file descriptor, and a
-/// negative value indicates that the file descriptor used to be open.
-///
-/// Due to internally using an [AtomicI32], it is thread-safe.
-///
-/// Mapping:
-/// - `DirFd > 0` : This is an open handle with this file descriptor.
-/// - `DirFd == 0` : Uninitialized.
-/// - `DirFd < 0` : We had an open handle as `abs(DirFd)`, but it was closed.
+/**
+A thin wrapper around a [[RawFd]] with some extra functionality.
+
+Notably, a [DirFd] can resolve its path from the file descriptor, and a
+negative value indicates that the file descriptor used to be open.
+
+Due to internally using an [AtomicI32], it is thread-safe.
+
+Mapping:
+- `DirFd > 0` : This is an open handle with this file descriptor.
+- `DirFd == 0` : Uninitialized.
+- `DirFd < 0` : We had an open handle as `abs(DirFd)`, but it was closed.
+*/
 #[derive(Debug)]
 pub struct DirFd(AtomicI32);
 
@@ -124,11 +126,13 @@ impl DirFd {
         self.fd() > 0
     }
 
-    /// Set the inner file descriptor.
-    ///
-    /// Returns the file descriptor if it was set successfully.
-    /// If the fd is already set, returns an error with the existing fd.
-    /// In the latter case, the caller should clear the existing fd first.
+    /**
+    Set the inner file descriptor.
+
+    Returns the file descriptor if it was set successfully.
+    If the fd is already set, returns an error with the existing fd.
+    In the latter case, the caller should clear the existing fd first.
+    */
     pub fn set(&self, fd: RawFd) -> Result<RawFd, RawFd> {
         let current: i32 = self.fd();
         if current > 0 {
@@ -138,10 +142,12 @@ impl DirFd {
         Ok(fd)
     }
 
-    /// Clear the file descriptor.
-    ///
-    /// If the fd is set, we "store" the negative value of the fd.
-    /// If the fd is already cleared (negative), we set it to 0.
+    /**
+    Clear the file descriptor.
+
+    If the fd is set, we "store" the negative value of the fd.
+    If the fd is already cleared (negative), we set it to 0.
+    */
     pub fn clear(&self) {
         let current: i32 = self.fd();
         if current > 0 {
@@ -509,9 +515,11 @@ impl DirectoryState {
         }
     }
 
-    /// Compare two states and return the type of change as a [StateChange] enum.
-    /// First change seen is returned, so `DirNum` or `FileNum` change implies
-    /// a `DirHash` or `FileHash` change, respectively.
+    /**
+    Compare two states and return the type of change as a [StateChange] enum.
+    First change seen is returned, so `DirNum` or `FileNum` change implies
+    a `DirHash` or `FileHash` change, respectively.
+    */
     pub fn change(&self, other: &Self) -> StateChange {
         if self.dirs != other.dirs {
             return StateChange::DirNum(self.dirs as i32 - other.dirs as i32);
@@ -1081,10 +1089,12 @@ impl OpenHandles {
         self.0.iter().any(|entry| entry.value() == handle)
     }
 
-    /// Check out a handle from the map. Only allows one borrow at a time due
-    /// to internally using [DashMap::get_mut], which returns a [RefMut].
-    /// This is also thread-safe as DashMap (RefMut) is thread-safe due to its
-    /// internal locking using [parking_lot::RwLock].
+    /**
+    Check out a handle from the map. Only allows one borrow at a time due
+    to internally using [DashMap::get_mut], which returns a [RefMut].
+    This is also thread-safe as DashMap (RefMut) is thread-safe due to its
+    internal locking using [parking_lot::RwLock].
+    */
     fn checkout<'a>(&'a self, fd: RawFd) -> Option<CheckedOutHandle<'a>> {
         let ref_handle: RefMut<'a, RawFd, DirHandle> = self.0.get_mut(&fd)?;
         Some(CheckedOutHandle {
@@ -1173,12 +1183,14 @@ impl OpenHandles {
 // OpenHandles is thread-safe due to the internal DashMap being thread-safe.
 unsafe impl Sync for OpenHandles {}
 
-/// An exclusively locked [DirHandle] from the [OpenHandles] container.
-///
-/// `CheckedOutHandle` implements [Deref] and [DerefMut] so you can use it
-/// as a `DirHandle` directly. In addition, it has a `close()` method which
-/// removes the `DirHandle` from parent `OpenHandles` (hence the directory
-/// handle is closed and its file descriptor released when dropped).
+/**
+An exclusively locked [DirHandle] from the [OpenHandles] container.
+
+`CheckedOutHandle` implements [Deref] and [DerefMut] so you can use it
+as a `DirHandle` directly. In addition, it has a `close()` method which
+removes the `DirHandle` from parent `OpenHandles` (hence the directory
+handle is closed and its file descriptor released when dropped).
+*/
 pub struct CheckedOutHandle<'a> {
     inner: RefMut<'a, RawFd, DirHandle>,
     // Using `Rc` instead of `Arc` here is deliberate because we don't want to
