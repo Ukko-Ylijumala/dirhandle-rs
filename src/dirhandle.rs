@@ -6,6 +6,7 @@ use super::{ToDebug, ToDisplay};
 use crate::enhvec::EnhVec;
 use crate::hashing::{CustomXxh3Hasher, Xxh3Hashable};
 use crate::timesince::TimeSinceEpoch;
+use core::mem::size_of;
 use dashmap::{mapref::one::RefMut, DashMap};
 use libc;
 use nix::{
@@ -13,8 +14,9 @@ use nix::{
     fcntl::{openat2, AtFlags, OFlag, OpenHow, ResolveFlag},
     sys::stat::{fstatat, Mode},
 };
+use size_of::{Context, SizeOf};
 use std::{
-    cmp::{Eq, Ordering, PartialEq, PartialOrd, Ord},
+    cmp::{Eq, Ord, Ordering, PartialEq, PartialOrd},
     collections::VecDeque,
     fmt::{self, Debug, Display, Formatter},
     fs::{read_link, File, OpenOptions},
@@ -797,6 +799,22 @@ impl AsRawFd for DirHandle {
 // DirHandle can be Send, since the underlying nix::dir::Dir is Send as well.
 unsafe impl Send for DirHandle {}
 
+const DHSIZE: usize = 296;
+
+impl SizeOf for DirHandle {
+    fn size_of_children(&self, context: &mut Context) {
+        // nix::dir::Dir:
+        // - ptr::NonNull - 8 bytes
+        // - libc::DIR - 8? bytes
+        // - libc::dirent - 280 bytes
+        // DirectoryState: 48 bytes
+        // Total: 344 + 8 (padding) = 352 bytes
+        context
+            .add(DHSIZE + 8 + size_of::<DirectoryState>())
+            .add_distinct_allocation();
+    }
+}
+
 /* ######################################################################### */
 
 /**
@@ -1182,6 +1200,26 @@ impl OpenHandles {
 
 // OpenHandles is thread-safe due to the internal DashMap being thread-safe.
 unsafe impl Sync for OpenHandles {}
+
+impl SizeOf for OpenHandles {
+    fn size_of_children(&self, context: &mut Context) {
+        if self.0.capacity() > 0 {
+            let used: usize = DHSIZE * self.0.len();
+            let total: usize = DHSIZE * self.0.capacity();
+            context
+                .add(used)
+                .add_excess(total - used)
+                .add_distinct_allocation();
+
+            self.0.iter().for_each(|itm| {
+                itm.key().size_of_children(context);
+                itm.value().size_of_children(context);
+            });
+        }
+
+        self.0.hasher().size_of_children(context);
+    }
+}
 
 /**
 An exclusively locked [DirHandle] from the [OpenHandles] container.
