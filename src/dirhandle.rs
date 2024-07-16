@@ -6,7 +6,6 @@ use super::{ToDebug, ToDisplay};
 use crate::enhvec::EnhVec;
 use crate::hashing::{CustomXxh3Hasher, Xxh3Hashable};
 use crate::timesince::TimeSinceEpoch;
-use core::mem::size_of;
 use dashmap::{mapref::one::RefMut, DashMap};
 use libc;
 use nix::{
@@ -807,10 +806,9 @@ impl SizeOf for DirHandle {
         // - ptr::NonNull - 8 bytes
         // - libc::DIR - 8? bytes
         // - libc::dirent - 280 bytes
-        // DirectoryState: 48 bytes
-        // Total: 344 + 8 (padding) = 352 bytes
+        // Total: 296 + 8 (padding?) = 304 bytes
         context
-            .add(DHSIZE + 8 + size_of::<DirectoryState>())
+            .add(DHSIZE + 8)
             .add_distinct_allocation();
     }
 }
@@ -1204,8 +1202,8 @@ unsafe impl Sync for OpenHandles {}
 impl SizeOf for OpenHandles {
     fn size_of_children(&self, context: &mut Context) {
         if self.0.capacity() > 0 {
-            let used: usize = DHSIZE * self.0.len();
-            let total: usize = DHSIZE * self.0.capacity();
+            let used: usize = (DHSIZE + 4) * self.0.len();
+            let total: usize = (DHSIZE + 4) * self.0.capacity();
             context
                 .add(used)
                 .add_excess(total - used)
