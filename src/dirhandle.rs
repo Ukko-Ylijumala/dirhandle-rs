@@ -1,4 +1,4 @@
-// Copyright (c) 2024 Mikko Tanner. All rights reserved.
+// Copyright (c) 2024-2025 Mikko Tanner. All rights reserved.
 
 #![allow(dead_code)]
 
@@ -13,7 +13,6 @@ use nix::{
     fcntl::{openat2, AtFlags, OFlag, OpenHow, ResolveFlag},
     sys::stat::{fstatat, Mode},
 };
-use size_of::{Context, SizeOf};
 use std::{
     cmp::{Eq, Ord, Ordering, PartialEq, PartialOrd},
     collections::VecDeque,
@@ -33,6 +32,9 @@ use std::{
     },
 };
 use tracing::{debug, instrument, trace, warn};
+
+#[cfg(feature = "size_of")]
+use size_of::{Context, SizeOf};
 
 const DOT1: &[u8] = b".";
 const DOT2: &[u8] = b"..";
@@ -800,6 +802,7 @@ unsafe impl Send for DirHandle {}
 
 const DHSIZE: usize = 296;
 
+#[cfg(feature = "size_of")]
 impl SizeOf for DirHandle {
     fn size_of_children(&self, context: &mut Context) {
         // nix::dir::Dir:
@@ -1199,6 +1202,7 @@ impl OpenHandles {
 // OpenHandles is thread-safe due to the internal DashMap being thread-safe.
 unsafe impl Sync for OpenHandles {}
 
+#[cfg(feature = "size_of")]
 impl SizeOf for OpenHandles {
     fn size_of_children(&self, context: &mut Context) {
         if self.0.capacity() > 0 {
