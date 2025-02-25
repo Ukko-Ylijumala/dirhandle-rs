@@ -3,7 +3,7 @@
 #![allow(dead_code)]
 
 use super::{ToDebug, ToDisplay};
-use crate::enhvec::EnhVec;
+use enhvec::EnhVec;
 use crate::hashing::{CustomXxh3Hasher, Xxh3Hashable};
 use timesince::TimeSinceEpoch;
 use dashmap::{mapref::one::RefMut, DashMap};
