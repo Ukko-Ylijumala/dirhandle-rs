@@ -1,7 +1,5 @@
 // Copyright (c) 2024-2025 Mikko Tanner. All rights reserved.
 
-#![allow(dead_code)]
-
 use custom_xxh3::{CustomXxh3Hasher, Xxh3Hashable};
 use dashmap::{mapref::one::RefMut, DashMap};
 use enhvec::EnhVec;
@@ -814,10 +812,10 @@ impl AsRawFd for DirHandle {
 // DirHandle can be Send, since the underlying nix::dir::Dir is Send as well.
 unsafe impl Send for DirHandle {}
 
-const DHSIZE: usize = 296;
-
 #[cfg(feature = "size_of")]
 impl SizeOf for DirHandle {
+    const DHSIZE: usize = 296;
+
     fn size_of_children(&self, context: &mut Context) {
         // nix::dir::Dir:
         // - ptr::NonNull - 8 bytes
