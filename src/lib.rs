@@ -1,5 +1,7 @@
 // Copyright (c) 2024-2025 Mikko Tanner. All rights reserved.
 
+#![allow(dead_code)]
+
 use custom_xxh3::{CustomXxh3Hasher, Xxh3Hashable};
 use dashmap::{mapref::one::RefMut, DashMap};
 use enhvec::EnhVec;
@@ -814,14 +816,13 @@ unsafe impl Send for DirHandle {}
 
 #[cfg(feature = "size_of")]
 impl SizeOf for DirHandle {
-    const DHSIZE: usize = 296;
-
     fn size_of_children(&self, context: &mut Context) {
         // nix::dir::Dir:
         // - ptr::NonNull - 8 bytes
         // - libc::DIR - 8? bytes
         // - libc::dirent - 280 bytes
         // Total: 296 + 8 (padding?) = 304 bytes
+        let DHSIZE: usize = 296;
         context.add(DHSIZE + 8).add_distinct_allocation();
     }
 }
