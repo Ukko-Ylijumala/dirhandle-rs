@@ -814,6 +814,8 @@ impl AsRawFd for DirHandle {
 // DirHandle can be Send, since the underlying nix::dir::Dir is Send as well.
 unsafe impl Send for DirHandle {}
 
+const DHSIZE: usize = 296;
+
 #[cfg(feature = "size_of")]
 impl SizeOf for DirHandle {
     fn size_of_children(&self, context: &mut Context) {
@@ -822,7 +824,6 @@ impl SizeOf for DirHandle {
         // - libc::DIR - 8? bytes
         // - libc::dirent - 280 bytes
         // Total: 296 + 8 (padding?) = 304 bytes
-        let DHSIZE: usize = 296;
         context.add(DHSIZE + 8).add_distinct_allocation();
     }
 }
