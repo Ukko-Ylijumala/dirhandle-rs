@@ -1,0 +1,32 @@
+[package]
+name = "dirhandle"
+version = "0.3.4"
+authors = ["Mikko Tanner <mikko.tanner@gmail.com>"]
+description = "Directory handle utility and container library for Rust"
+repository = "https://github.com/Ukko-Ylijumala/dirhandle-rs"
+readme = "README.md"
+license = "MIT OR Apache-2.0"
+categories = ["caching", "filesystem"]
+keywords = ["utilities", "filesystem", "directory", "handle", "nix"]
+publish = false
+edition = "2021"
+
+[features]
+#default = ["size_of"]
+size_of = ["dep:size-of"]
+
+[dependencies]
+libc = "0.2"
+tracing = "0.1"
+custom_xxh3 = { git = "https://github.com/Ukko-Ylijumala/custom_xxh3", features = ["size_of"] }
+timesince = { git = "https://github.com/Ukko-Ylijumala/timesince-rs" }
+enhvec = { git = "https://github.com/Ukko-Ylijumala/enhvec-rs" }
+miniutils = { git = "https://github.com/Ukko-Ylijumala/miniutils-rs" }
+size-of = { version = "0.1", optional = true }
+
+[dependencies.nix]
+version = "0.29"
+features = ["fs", "dir"]
+
+[dependencies.dashmap]
+version = "6.0"
