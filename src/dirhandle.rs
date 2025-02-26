@@ -39,6 +39,7 @@ use size_of::{Context, SizeOf};
 const DOT1: &[u8] = b".";
 const DOT2: &[u8] = b"..";
 const LOOKAHEAD_BUFFER_SIZE: usize = 64;
+const PROC_FD_PATH: &str = "/proc/self/fd";
 
 /**
 Since we cannot import [std::sys] directly (it's private), we need to
@@ -132,8 +133,9 @@ impl DirFd {
     /**
     Set the inner file descriptor.
 
-    Returns the file descriptor if it was set successfully.
-    If the fd is already set, returns an error with the existing fd.
+    - Returns the file descriptor if it was set successfully.
+    - If the fd is already set, returns an error with the existing fd.
+    
     In the latter case, the caller should clear the existing fd first.
     */
     pub fn set(&self, fd: RawFd) -> Result<RawFd, RawFd> {
@@ -163,12 +165,24 @@ impl DirFd {
     /**
     This relies on proc filesystem being available due to the use of
     `/proc/self/fd` to resolve the path from the file descriptor.
+
+    We return [[io::Error]] on:
+    - no file descriptor
+    - stale file descriptor
+    - procfs not available
+    - file descriptor not found in procfs
     */
     pub fn path(&self) -> io::Result<PathBuf> {
-        if self.fd() < 1 {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "No such file descriptor"));
+        if read_link(PROC_FD_PATH).is_err() {
+            return Err(io::Error::new(io::ErrorKind::Unsupported, "procfs not available"));
         }
-        read_link(format!("/proc/self/fd/{}", self.fd()))
+        if self.fd() == 0 {
+            return Err(io::Error::new(io::ErrorKind::NotFound, "no file descriptor"));
+        }
+        if self.fd() < 0 {
+            return Err(io::Error::new(io::ErrorKind::NotFound, "stale file descriptor"));
+        }
+        read_link(format!("{}/{}", PROC_FD_PATH, self.fd()))
     }
 }
 
