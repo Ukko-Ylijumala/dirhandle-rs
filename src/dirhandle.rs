@@ -2,12 +2,11 @@
 
 #![allow(dead_code)]
 
-use super::{ToDebug, ToDisplay};
-use enhvec::EnhVec;
-use crate::hashing::{CustomXxh3Hasher, Xxh3Hashable};
-use timesince::TimeSinceEpoch;
+use custom_xxh3::{CustomXxh3Hasher, Xxh3Hashable};
 use dashmap::{mapref::one::RefMut, DashMap};
+use enhvec::EnhVec;
 use libc;
+use miniutils::{ToDebug, ToDisplay};
 use nix::{
     dir::{Dir, Entry, Iter, Type},
     fcntl::{openat2, AtFlags, OFlag, OpenHow, ResolveFlag},
@@ -31,6 +30,7 @@ use std::{
         OnceLock,
     },
 };
+use timesince::TimeSinceEpoch;
 use tracing::{debug, instrument, trace, warn};
 
 #[cfg(feature = "size_of")]
@@ -135,7 +135,7 @@ impl DirFd {
 
     - Returns the file descriptor if it was set successfully.
     - If the fd is already set, returns an error with the existing fd.
-    
+
     In the latter case, the caller should clear the existing fd first.
     */
     pub fn set(&self, fd: RawFd) -> Result<RawFd, RawFd> {
@@ -824,9 +824,7 @@ impl SizeOf for DirHandle {
         // - libc::DIR - 8? bytes
         // - libc::dirent - 280 bytes
         // Total: 296 + 8 (padding?) = 304 bytes
-        context
-            .add(DHSIZE + 8)
-            .add_distinct_allocation();
+        context.add(DHSIZE + 8).add_distinct_allocation();
     }
 }
 
@@ -966,7 +964,7 @@ impl<'handle> DirHandleIter<'handle> {
 
                 #[cfg(debug_assertions)]
                 {
-                    use crate::hashing::hash_item;
+                    use custom_xxh3::hash_item;
                     let mut xxh: &mut CustomXxh3Hasher = self.xxh.as_mut().unwrap();
                     ec.xxh3(&mut xxh);
                     let vec: EntryVec = EnhVec::new_from(vec![entry.clone()]);
