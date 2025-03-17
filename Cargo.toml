@@ -20,7 +20,6 @@ libc = "0.2"
 tracing = "0.1"
 custom_xxh3 = { git = "https://github.com/Ukko-Ylijumala/custom_xxh3", features = ["size_of"] }
 timesince = { git = "https://github.com/Ukko-Ylijumala/timesince-rs" }
-enhvec = { git = "https://github.com/Ukko-Ylijumala/enhvec-rs" }
 miniutils = { git = "https://github.com/Ukko-Ylijumala/miniutils-rs" }
 size-of = { version = "0.1", optional = true }
 
@@ -30,3 +29,7 @@ features = ["fs", "dir"]
 
 [dependencies.dashmap]
 version = "6.0"
+
+[dependencies.enhvec]
+git = "https://github.com/Ukko-Ylijumala/enhvec-rs"
+version = "0.3.3"
