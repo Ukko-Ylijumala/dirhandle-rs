@@ -1,6 +1,6 @@
 [package]
 name = "dirhandle"
-version = "0.3.5"
+version = "0.3.6"
 authors = ["Mikko Tanner <mikko.tanner@gmail.com>"]
 description = "Directory handle utility and container library for Rust"
 repository = "https://github.com/Ukko-Ylijumala/dirhandle-rs"
@@ -32,4 +32,4 @@ version = "6.0"
 
 [dependencies.enhvec]
 git = "https://github.com/Ukko-Ylijumala/enhvec-rs"
-version = "0.3.3"
+version = "0.4.1"

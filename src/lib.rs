@@ -4,7 +4,7 @@
 
 use custom_xxh3::{CustomXxh3Hasher, Xxh3Hashable};
 use dashmap::{mapref::one::RefMut, DashMap};
-use enhvec::EnhVec;
+use enhvec::{EnhVec, Sorting};
 use libc;
 use miniutils::{ToDebug, ToDisplay};
 use nix::{
@@ -763,8 +763,8 @@ impl DirHandle {
     /// Return the directory entries as sorted tuples of directories and files.
     pub fn entries_sorted<'handle>(&'handle mut self) -> (EntryVec, EntryVec) {
         let (mut dirs, mut files) = self.entries(true, true);
-        dirs.sort_by(|a: &EntryExt, b: &EntryExt| a.cmp(b));
-        files.sort_by(|a: &EntryExt, b: &EntryExt| a.cmp(b));
+        dirs.sort(Sorting::Ascending);
+        files.sort(Sorting::Ascending);
         (dirs, files)
     }
 
@@ -778,9 +778,9 @@ impl DirHandle {
         let (mut dirs, mut files) = self.entries(true, true);
 
         // NOTE: we sort in reverse order to pop the entries in alphabetical order
-        dirs.sort_by(|a: &EntryExt, b: &EntryExt| b.cmp(a));
-        files.sort_by(|a: &EntryExt, b: &EntryExt| b.cmp(a));
-        files.extend_from_slice(&dirs);
+        dirs.sort(Sorting::Descending);
+        files.sort(Sorting::Descending);
+        files.extend(dirs);
         DirHandleIterSorted(files, PhantomData)
     }
 }
