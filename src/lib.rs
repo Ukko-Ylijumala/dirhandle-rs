@@ -22,7 +22,7 @@ use std::{
     iter::Peekable,
     marker::PhantomData,
     ops::{Deref, DerefMut},
-    os::fd::{AsRawFd, FromRawFd, RawFd},
+    os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, RawFd},
     path::{Path, PathBuf},
     rc::Rc,
     sync::{
@@ -115,8 +115,8 @@ Mapping:
 pub struct DirFd(AtomicI32);
 
 impl DirFd {
-    pub fn new(fd: RawFd) -> Self {
-        DirFd(fd.into())
+    pub fn new<Fd: AsRawFd>(fd: Fd) -> Self {
+        DirFd(fd.as_raw_fd().into())
     }
 
     /// Returns the file descriptor.
@@ -228,6 +228,12 @@ impl Hash for DirFd {
     }
 }
 
+impl AsFd for DirFd {
+    fn as_fd(&self) -> BorrowedFd {
+        unsafe { BorrowedFd::borrow_raw(self.into()) }
+    }
+}
+
 impl AsRawFd for DirFd {
     fn as_raw_fd(&self) -> RawFd {
         self.fd()
@@ -290,8 +296,13 @@ impl EntryExt {
     NOTE: If for some reason we cannot stat the entry, we return `None`.
     */
     pub fn stat(&self) -> Option<libc::stat> {
+        if !self.dirfd.is_open() {
+            warn!("Attempted to stat an entry with a closed directory fd: {:?}", self.dirfd);
+            return None;
+        }
+
         *self.stat.get_or_init(|| {
-            match fstatat(Some(self.dirfd.fd()), self.file_name(), AtFlags::AT_SYMLINK_NOFOLLOW) {
+            match fstatat(&self.dirfd, self.file_name(), AtFlags::AT_SYMLINK_NOFOLLOW) {
                 Ok(stat) => Some(stat),
                 Err(_) => None,
             }
@@ -333,11 +344,16 @@ impl EntryExt {
 
     /// Open a [std::fs::File] object from a raw file descriptor.
     fn open(&self, flags: OFlag) -> io::Result<File> {
+        if !self.dirfd.is_open() {
+            warn!("Attempted to open a file from a closed directory fd: {:?}", self.dirfd);
+            return Err(io::Error::new(io::ErrorKind::NotFound, "closed directory fd"));
+        }
+
         let open_how: OpenHow = OpenHow::new()
             .flags(flags)
             .resolve(ResolveFlag::RESOLVE_BENEATH);
-        let fd: i32 = openat2(self.dirfd.fd(), self.file_name(), open_how)?;
-        Ok(unsafe { File::from_raw_fd(fd) })
+        let fd = openat2(&self.dirfd, self.file_name(), open_how)?;
+        Ok(unsafe { File::from_raw_fd(fd.into_raw_fd()) })
     }
 
     /// Open this entry for reading as a [std::fs::File] object.
