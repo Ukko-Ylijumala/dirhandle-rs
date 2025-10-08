@@ -229,7 +229,7 @@ impl Hash for DirFd {
 }
 
 impl AsFd for DirFd {
-    fn as_fd(&self) -> BorrowedFd {
+    fn as_fd(&'_ self) -> BorrowedFd<'_> {
         unsafe { BorrowedFd::borrow_raw(self.into()) }
     }
 }
@@ -744,12 +744,12 @@ impl DirHandle {
     - maintains a lookahead buffer to preferentially return directory
       entries before other entries (NOTE: not a guarantee)
     */
-    pub fn iter(&mut self) -> DirHandleIter {
+    pub fn iter(&'_ mut self) -> DirHandleIter<'_> {
         DirHandleIter::new(self, false)
     }
 
     /// Same as `iter()`, but also explicitly `stat()`s each entry.
-    pub fn iter_stat(&mut self) -> DirHandleIter {
+    pub fn iter_stat(&'_ mut self) -> DirHandleIter<'_> {
         DirHandleIter::new(self, true)
     }
 
@@ -790,7 +790,7 @@ impl DirHandle {
     - returns directory entries before all other entries
     - sorts both entry lists alphabetically (separately)
     */
-    pub fn iter_sorted(&mut self) -> DirHandleIterSorted {
+    pub fn iter_sorted(&'_ mut self) -> DirHandleIterSorted<'_> {
         let (mut dirs, mut files) = self.entries(true, true);
 
         // NOTE: we sort in reverse order to pop the entries in alphabetical order
@@ -1158,7 +1158,7 @@ impl OpenHandles {
     **NOTE**: may deadlock if called while holding any kind of reference
     into this [OpenHandles] in the same thread.
     */
-    pub fn open(&self, path: &Path) -> io::Result<CheckedOutHandle> {
+    pub fn open(&'_ self, path: &Path) -> io::Result<CheckedOutHandle<'_>> {
         let handle: DirHandle = DirHandle::new(path)?;
         let fd: RawFd = handle.as_raw_fd();
         self.0.insert(fd, handle);
@@ -1177,7 +1177,7 @@ impl OpenHandles {
     **NOTE**: may deadlock if called while holding any kind of reference
     into this [OpenHandles] in the same thread.
     */
-    pub fn get(&self, fd: RawFd) -> Option<CheckedOutHandle> {
+    pub fn get(&'_ self, fd: RawFd) -> Option<CheckedOutHandle<'_>> {
         self.checkout(fd)
     }
 
