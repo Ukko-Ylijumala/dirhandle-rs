@@ -21,7 +21,12 @@ tracing = "0.1"
 custom_xxh3 = { git = "https://github.com/Ukko-Ylijumala/custom_xxh3", features = ["size_of"] }
 timesince = { git = "https://github.com/Ukko-Ylijumala/timesince-rs" }
 miniutils = { git = "https://github.com/Ukko-Ylijumala/miniutils-rs" }
-size-of = { version = "0.1", optional = true }
+#size-of = { version = "0.1", optional = true }
+
+[dependencies.size-of]
+git = "https://github.com/Ukko-Ylijumala/size-of"
+version = "0.1.7"
+optional = true
 
 [dependencies.nix]
 version = "0.30"
