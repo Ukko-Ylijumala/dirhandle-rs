@@ -370,9 +370,11 @@ impl EntryExt {
     pub fn name_as_bytes(&self) -> &[u8] {
         self.file_name().to_bytes()
     }
+    /// Lossily converts the original `Cstr` entry name to a `String`.
+    /// If you need the original name, use `file_name()` instead.
     #[inline]
-    pub fn name(&self) -> &str {
-        self.file_name().to_str().unwrap()
+    pub fn name(&self) -> String {
+        self.file_name().to_string_lossy().into_owned()
     }
 
     /**
