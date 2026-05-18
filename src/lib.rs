@@ -1177,7 +1177,14 @@ impl OpenHandles {
         let handle: DirHandle = DirHandle::new(path)?;
         let fd: RawFd = handle.as_raw_fd();
         self.0.insert(fd, handle);
-        Ok(self.checkout(fd).unwrap())
+        // Between the insert above and the checkout below, another thread on
+        // this same OpenHandles could call close(fd) and evict our just-opened
+        // handle. The fd value is freshly allocated by the kernel and the
+        // race is exceedingly rare, but turning it into io::Error is cheap and
+        // strictly better than panicking inside a library entry point.
+        self.checkout(fd).ok_or_else(|| {
+            io::Error::other("handle closed concurrently between insert and checkout")
+        })
     }
 
     /// Insert a handle into the map. Replaces an existing handle with the same
