@@ -1041,18 +1041,25 @@ impl<'handle> Iterator for DirHandleIter<'handle> {
                                 }
                             } else {
                                 // we must get the next entry to determine its type
-                                self.get_one().map(|extra: EntryExt| {
-                                    trace!(target: "try_get_extra_dir", "{:?} : {extra:?}", extra.name());
-                                    if extra.is_dir() {
-                                        // push the current entry back to the buffer...
-                                        self.buf.push(entry);
-                                        // ... and return the directory entry
-                                        return Some(extra);
-                                    } else {
-                                        self.buf.push(extra);
+                                match self.get_one() {
+                                    Some(extra) => {
+                                        trace!(target: "try_get_extra_dir", "{:?} : {extra:?}", extra.name());
+                                        if extra.is_dir() {
+                                            // push the current entry back to the buffer...
+                                            self.buf.push(entry);
+                                            // ... and return the directory entry
+                                            return Some(extra);
+                                        } else {
+                                            self.buf.push(extra);
+                                            return Some(entry);
+                                        }
+                                    }
+                                    None => {
+                                        // inner iterator exhausted; the current
+                                        // entry is the last one to yield.
                                         return Some(entry);
                                     }
-                                });
+                                }
                             }
                         }
                     }
