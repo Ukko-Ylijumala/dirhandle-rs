@@ -242,8 +242,27 @@ impl Hash for DirFd {
 }
 
 impl AsFd for DirFd {
+    /// Returns a [BorrowedFd] view of the stored fd.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the `DirFd` is not in the "open" state (`is_open()` returns
+    /// false). `BorrowedFd::borrow_raw` forbids `-1` and requires the fd to
+    /// be open for the borrow's lifetime; passing a stale or uninitialized
+    /// value here would be undefined behaviour, so we choose a deterministic
+    /// panic over silent UB. Callers that may legitimately hold a closed
+    /// `DirFd` should test `is_open()` before invoking this method.
     fn as_fd(&'_ self) -> BorrowedFd<'_> {
-        unsafe { BorrowedFd::borrow_raw(self.into()) }
+        let fd: RawFd = self.fd();
+        assert!(
+            fd >= 0,
+            "DirFd::as_fd called on closed or uninitialized DirFd (raw: {fd})",
+        );
+        // SAFETY: We checked `fd >= 0`, satisfying the minimum precondition of
+        // `BorrowedFd::borrow_raw` (which forbids -1). Per-call OS-level
+        // openness of the fd remains the caller's responsibility, as documented
+        // on the method.
+        unsafe { BorrowedFd::borrow_raw(fd) }
     }
 }
 
