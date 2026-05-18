@@ -146,14 +146,17 @@ impl DirFd {
     - If the fd is already set, returns an error with the existing fd.
 
     In the latter case, the caller should clear the existing fd first.
+
+    Atomic with respect to other `set` / `clear` calls: two concurrent
+    `set`s cannot both succeed, and a concurrent `clear` either lands
+    before or after — never in between the check and the store.
     */
     pub fn set(&self, fd: RawFd) -> Result<RawFd, RawFd> {
-        let current: i32 = self.fd();
-        if current >= 0 {
-            return Err(current);
-        }
-        self.0.store(fd, Relaxed);
-        Ok(fd)
+        self.0
+            .fetch_update(Relaxed, Relaxed, |current| {
+                if current >= 0 { None } else { Some(fd) }
+            })
+            .map(|_| fd)
     }
 
     /**
@@ -162,14 +165,13 @@ impl DirFd {
     If the fd is open, we encode it as `!fd` (bitwise NOT) so that even
     `fd == 0` produces a distinct non-zero stale marker (`-1`). If the
     stored value is already stale or uninit, we bury it at [UNINIT_FD].
+
+    Atomic with respect to other `set` / `clear` calls.
     */
     pub fn clear(&self) {
-        let current: i32 = self.fd();
-        if current >= 0 {
-            self.0.store(!current, Relaxed);
-        } else {
-            self.0.store(UNINIT_FD, Relaxed);
-        }
+        let _ = self.0.fetch_update(Relaxed, Relaxed, |current| {
+            Some(if current >= 0 { !current } else { UNINIT_FD })
+        });
     }
 
     /**

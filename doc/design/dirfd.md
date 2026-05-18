@@ -22,6 +22,8 @@ The stale encoding uses `!fd` rather than `-fd` so that the unique sentinel `0` 
 
 `set()` is fail-safe: it refuses to overwrite a currently-open fd, returning `Err(existing)`. Callers must `clear()` first if they really mean to replace the fd.
 
+Both `set()` and `clear()` use `AtomicI32::fetch_update`, so the check-and-store is a single CAS loop. Two concurrent `set()` calls cannot both succeed, and a `clear()` interleaved with a `set()` either fully precedes or fully follows it — never lands between the check and the store.
+
 ## Path resolution
 
 `path()` resolves the fd back to a filesystem path by reading `/proc/self/fd/<fd>`. This is a hard dependency on Linux procfs being mounted; on systems where it isn't, `path()` returns `io::ErrorKind::Unsupported`. Other failure modes (`NotFound` for `0` or negative fds) are returned without touching procfs.
