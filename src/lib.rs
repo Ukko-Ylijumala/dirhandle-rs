@@ -973,6 +973,12 @@ impl<'handle> DirHandleIter<'handle> {
     fn is_next_dir(&mut self) -> Option<bool> {
         self.inner.peek().map_or(Some(false), |res| {
             res.map_or(Some(false), |e: Entry| {
+                // `.` and `..` are both directories, but `get_one()` filters
+                // them out — treating them as "next dir" here would wrongly
+                // defer the current entry only to have the dot skipped.
+                if matches!(e.file_name().to_bytes(), DOT1 | DOT2) {
+                    return Some(false);
+                }
                 e.file_type()
                     .map_or(None, |t: Type| Some(t == Type::Directory))
             })
