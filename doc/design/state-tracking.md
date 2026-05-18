@@ -25,8 +25,8 @@ This is a deliberate trade-off: most callers iterate to consume entries, not to 
 
 `DirectoryState::change(&other)` returns the first detected difference, in order:
 
-1. `DirNum(delta)` — directory count differs.
-2. `FileNum(delta)` — file count differs.
+1. `DirNum(delta)` — directory count differs. `delta = other.dirs - self.dirs`; positive means "added since `self`," negative means "removed."
+2. `FileNum(delta)` — file count differs. Same sign convention as `DirNum`.
 3. `DirHash` — same counts, different directory-entry hash.
 4. `FileHash` — same counts, different file-entry hash.
 5. `Unchanged` — all four fields match.

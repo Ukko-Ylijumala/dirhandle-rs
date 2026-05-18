@@ -510,9 +510,11 @@ respectively, but the reverse is not true. But since we first check for
 #[derive(Debug)]
 pub enum StateChange {
     Unchanged,
-    /// Directory count change (positive or negative)
+    /// Directory count change: positive = directories added since the previous
+    /// snapshot, negative = removed.
     DirNum(i32),
-    /// File count change (positive or negative)
+    /// File count change: positive = files added since the previous snapshot,
+    /// negative = removed.
     FileNum(i32),
     /// Same directory count, but hash of dir entries has changed
     DirHash,
@@ -552,15 +554,19 @@ impl DirectoryState {
 
     /**
     Compare two states and return the type of change as a [StateChange] enum.
-    First change seen is returned, so `DirNum` or `FileNum` change implies
+    `self` is the previous snapshot; `other` is the newer one. The first
+    change seen is returned, so `DirNum` or `FileNum` change implies
     a `DirHash` or `FileHash` change, respectively.
+
+    Count deltas are signed as `other - self`, so a positive value means
+    entries were added since `self` and a negative value means removed.
     */
     pub fn change(&self, other: &Self) -> StateChange {
         if self.dirs != other.dirs {
-            return StateChange::DirNum(self.dirs as i32 - other.dirs as i32);
+            return StateChange::DirNum(other.dirs as i32 - self.dirs as i32);
         }
         if self.files != other.files {
-            return StateChange::FileNum(self.files as i32 - other.files as i32);
+            return StateChange::FileNum(other.files as i32 - self.files as i32);
         }
         if self.hash_d != other.hash_d {
             return StateChange::DirHash;
