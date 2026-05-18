@@ -6,13 +6,19 @@
 
 The inner `AtomicI32` carries both the fd value and its lifecycle state:
 
-| Inner value | Meaning |
-| ----------- | ------- |
-| `> 0`       | Open file descriptor. |
-| `== 0`      | Uninitialized — no fd has ever been stored. |
-| `< 0`       | The fd was previously open as `abs(value)`, then explicitly cleared. |
+| Inner value           | Meaning |
+| --------------------- | ------- |
+| `>= 0`                | Open file descriptor. **fd 0 is a valid open fd** — a process that closed stdin can legitimately receive it back from `open()`. |
+| `i32::MIN`            | Uninitialized — the `Default` state. |
+| `< 0` (not `i32::MIN`)| Stale: the fd was previously open and has been cleared. The original fd is recoverable as `!stored` (bitwise NOT). |
 
-`clear()` deliberately flips a positive fd to its negative twin, preserving the historical fd number so downstream debugging can still ask "what fd did this used to be?" Clearing an already-cleared `DirFd` resets it to `0`.
+The stale encoding uses `!fd` rather than `-fd` so that the unique sentinel `0` and the unique sentinel for uninit don't collide. With `!fd`:
+
+- open fd 0 → stale `-1`
+- open fd 1 → stale `-2`
+- open fd N → stale `-(N+1)`
+
+`clear()` encodes the current open fd as `!current` if open, otherwise overwrites with `UNINIT_FD` (`i32::MIN`). A second `clear()` on an already-stale `DirFd` therefore "buries" it to uninitialized, losing the historical fd number — by design, since a thread holding a stale handle shouldn't pretend it still knows what was there.
 
 `set()` is fail-safe: it refuses to overwrite a currently-open fd, returning `Err(existing)`. Callers must `clear()` first if they really mean to replace the fd.
 

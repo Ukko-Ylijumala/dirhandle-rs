@@ -98,6 +98,11 @@ impl EntryType {
     }
 }
 
+/// Sentinel for "uninitialized DirFd." Picked so it cannot collide with any
+/// real fd: the kernel only hands out non-negative values, and `i32::MIN` is
+/// distinct from every stale-fd encoding (see `clear()` below).
+const UNINIT_FD: RawFd = i32::MIN;
+
 /**
 A thin wrapper around a [[RawFd]] with some extra functionality.
 
@@ -107,9 +112,13 @@ negative value indicates that the file descriptor used to be open.
 Due to internally using an [AtomicI32], it is thread-safe.
 
 Mapping:
-- `DirFd > 0` : This is an open handle with this file descriptor.
-- `DirFd == 0` : Uninitialized.
-- `DirFd < 0` : We had an open handle as `abs(DirFd)`, but it was closed.
+- `DirFd >= 0` : Open file descriptor. `fd == 0` is a valid (open) fd —
+  it's stdin's slot, but a process that closed stdin can legitimately
+  receive it from `open()`.
+- `DirFd == i32::MIN` : Uninitialized (the default state).
+- `DirFd < 0` (other than `i32::MIN`) : The fd was previously open and has
+  been cleared. The original fd is recoverable as `!stored` (bitwise NOT),
+  which keeps stale-from-fd-0 distinguishable from uninitialized.
 */
 #[derive(Debug)]
 pub struct DirFd(AtomicI32);
@@ -125,9 +134,9 @@ impl DirFd {
         self.0.load(Relaxed)
     }
 
-    /// Whether the file descriptor is open.
+    /// Whether the file descriptor is open. fd 0 is a valid (open) fd.
     pub fn is_open(&self) -> bool {
-        self.fd() > 0
+        self.fd() >= 0
     }
 
     /**
@@ -140,7 +149,7 @@ impl DirFd {
     */
     pub fn set(&self, fd: RawFd) -> Result<RawFd, RawFd> {
         let current: i32 = self.fd();
-        if current > 0 {
+        if current >= 0 {
             return Err(current);
         }
         self.0.store(fd, Relaxed);
@@ -150,15 +159,16 @@ impl DirFd {
     /**
     Clear the file descriptor.
 
-    If the fd is set, we "store" the negative value of the fd.
-    If the fd is already cleared (negative), we set it to 0.
+    If the fd is open, we encode it as `!fd` (bitwise NOT) so that even
+    `fd == 0` produces a distinct non-zero stale marker (`-1`). If the
+    stored value is already stale or uninit, we bury it at [UNINIT_FD].
     */
     pub fn clear(&self) {
         let current: i32 = self.fd();
-        if current > 0 {
-            self.0.store(-current, Relaxed);
+        if current >= 0 {
+            self.0.store(!current, Relaxed);
         } else {
-            self.0.store(0, Relaxed);
+            self.0.store(UNINIT_FD, Relaxed);
         }
     }
 
@@ -176,13 +186,14 @@ impl DirFd {
         if read_link(PROC_FD_PATH).is_err() {
             return Err(io::Error::new(io::ErrorKind::Unsupported, "procfs not available"));
         }
-        if self.fd() == 0 {
+        let fd: RawFd = self.fd();
+        if fd == UNINIT_FD {
             return Err(io::Error::new(io::ErrorKind::NotFound, "no file descriptor"));
         }
-        if self.fd() < 0 {
+        if fd < 0 {
             return Err(io::Error::new(io::ErrorKind::NotFound, "stale file descriptor"));
         }
-        read_link(format!("{}/{}", PROC_FD_PATH, self.fd()))
+        read_link(format!("{}/{}", PROC_FD_PATH, fd))
     }
 }
 
@@ -194,7 +205,7 @@ impl Clone for DirFd {
 
 impl Default for DirFd {
     fn default() -> Self {
-        DirFd(0.into())
+        DirFd(UNINIT_FD.into())
     }
 }
 
