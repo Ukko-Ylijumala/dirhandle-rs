@@ -277,18 +277,26 @@ Notable differences:
   if the file type is not available in the `dirent` struct
 - the stat result is cached in a `OnceLock` to avoid calling `fstatat()`
   multiple times for the same entry.
+
+The `'h` lifetime ties each entry to the [DirHandle] that produced it via
+a [BorrowedFd]: the parent handle's directory fd must remain open for as
+long as the entry exists, which the borrow checker enforces. Collecting
+entries into a `Vec` keeps the handle borrowed for the lifetime of the
+vec, so use-after-close zombies are not constructible from safe code.
 */
-#[derive(Debug, Eq, Clone)]
-pub struct EntryExt {
+#[derive(Debug, Clone)]
+pub struct EntryExt<'h> {
     entry: Entry,
-    dirfd: DirFd,
+    dirfd: BorrowedFd<'h>,
     stat: OnceLock<Option<libc::stat>>,
 }
 
-impl EntryExt {
+impl<'h> Eq for EntryExt<'h> {}
+
+impl<'h> EntryExt<'h> {
     /// Create an `EntryExt` from a given [Entry] and its parent directory fd.
     #[instrument(level = "trace")]
-    pub fn new(entry: Entry, dirfd: DirFd) -> Self {
+    pub fn new(entry: Entry, dirfd: BorrowedFd<'h>) -> Self {
         Self {
             entry,
             dirfd,
@@ -297,8 +305,8 @@ impl EntryExt {
     }
 
     /// Create a new `EntryExt` and also `stat()` it before returning it.
-    pub fn new_statted(entry: Entry, dirfd: DirFd) -> Self {
-        let new_e: EntryExt = Self::new(entry, dirfd);
+    pub fn new_statted(entry: Entry, dirfd: BorrowedFd<'h>) -> Self {
+        let new_e: EntryExt<'h> = Self::new(entry, dirfd);
         new_e.stat();
         new_e
     }
@@ -309,11 +317,6 @@ impl EntryExt {
     NOTE: If for some reason we cannot stat the entry, we return `None`.
     */
     pub fn stat(&self) -> Option<libc::stat> {
-        if !self.dirfd.is_open() {
-            warn!("Attempted to stat an entry with a closed directory fd: {:?}", self.dirfd);
-            return None;
-        }
-
         *self.stat.get_or_init(|| {
             match fstatat(&self.dirfd, self.file_name(), AtFlags::AT_SYMLINK_NOFOLLOW) {
                 Ok(stat) => Some(stat),
@@ -355,13 +358,8 @@ impl EntryExt {
         }
     }
 
-    /// Open a [std::fs::File] object from a raw file descriptor.
+    /// Open this entry as a [std::fs::File] with the given flags.
     fn open(&self, flags: OFlag) -> io::Result<File> {
-        if !self.dirfd.is_open() {
-            warn!("Attempted to open a file from a closed directory fd: {:?}", self.dirfd);
-            return Err(io::Error::new(io::ErrorKind::NotFound, "closed directory fd"));
-        }
-
         let open_how: OpenHow = OpenHow::new()
             .flags(flags)
             .resolve(ResolveFlag::RESOLVE_BENEATH);
@@ -395,10 +393,11 @@ impl EntryExt {
     `/proc/self/fd` to resolve the parent directory by file descriptor.
     */
     pub fn path(&self) -> io::Result<PathBuf> {
-        match self.dirfd.path() {
-            Ok(link) => Ok(link.join(self.name())),
-            Err(e) => Err(e),
+        if read_link(PROC_FD_PATH).is_err() {
+            return Err(io::Error::new(io::ErrorKind::Unsupported, "procfs not available"));
         }
+        let link = read_link(format!("{}/{}", PROC_FD_PATH, self.dirfd.as_raw_fd()))?;
+        Ok(link.join(self.name()))
     }
 
     /// Return the file type of the entry as a [nix::dir::Type] enum.
@@ -453,26 +452,26 @@ impl EntryExt {
 
 /* --------------------------------- */
 
-impl PartialEq for EntryExt {
+impl<'h> PartialEq for EntryExt<'h> {
     fn eq(&self, other: &Self) -> bool {
-        self.entry == other.entry && self.dirfd == other.dirfd
+        self.entry == other.entry && self.dirfd.as_raw_fd() == other.dirfd.as_raw_fd()
     }
 }
 
-impl Ord for EntryExt {
+impl<'h> Ord for EntryExt<'h> {
     #[inline]
     fn cmp(&self, other: &Self) -> Ordering {
         self.file_name().cmp(&other.file_name())
     }
 }
 
-impl PartialOrd for EntryExt {
+impl<'h> PartialOrd for EntryExt<'h> {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
 }
 
-impl Deref for EntryExt {
+impl<'h> Deref for EntryExt<'h> {
     type Target = Entry;
 
     fn deref(&self) -> &Self::Target {
@@ -482,7 +481,7 @@ impl Deref for EntryExt {
 
 /* --------------------------------- */
 
-impl Hash for EntryExt {
+impl<'h> Hash for EntryExt<'h> {
     #[inline]
     /// NOTE: this method will **not** produce stable hashes due to the standard
     /// `hash()` implementation's SipHash algorithm. Use `xxh3()` instead.
@@ -495,7 +494,7 @@ impl Hash for EntryExt {
     }
 }
 
-impl Xxh3Hashable for EntryExt {
+impl<'h> Xxh3Hashable for EntryExt<'h> {
     fn xxh3<H: Hasher>(&self, state: &mut H) {
         state.write(self.name_as_bytes());
         state.write_u64(self.entry.ino());
@@ -654,7 +653,7 @@ impl Display for DirectoryState {
 /* ######################################################################### */
 
 // Convenience type alias.
-type EntryVec = EnhVec<EntryExt>;
+type EntryVec<'h> = EnhVec<EntryExt<'h>>;
 
 /**
 An open handle to a directory, internally a [nix::dir::Dir] object. The aim
@@ -776,10 +775,14 @@ impl DirHandle {
 
     /// Return the directory entries as a tuple of directories and files.
     /// The booleans specify whether to include directories and/or files.
-    pub fn entries<'handle>(&'handle mut self, dirs: bool, files: bool) -> (EntryVec, EntryVec) {
-        let mut d_vec: EntryVec = EnhVec::new();
-        let mut f_vec: EntryVec = EnhVec::new();
-        self.iter().for_each(|entry: EntryExt| {
+    pub fn entries<'handle>(
+        &'handle mut self,
+        dirs: bool,
+        files: bool,
+    ) -> (EntryVec<'handle>, EntryVec<'handle>) {
+        let mut d_vec: EntryVec<'handle> = EnhVec::new();
+        let mut f_vec: EntryVec<'handle> = EnhVec::new();
+        self.iter().for_each(|entry: EntryExt<'handle>| {
             match entry.file_type() {
                 Some(Type::Directory) => {
                     if dirs {
@@ -798,7 +801,7 @@ impl DirHandle {
     }
 
     /// Return the directory entries as sorted tuples of directories and files.
-    pub fn entries_sorted<'handle>(&'handle mut self) -> (EntryVec, EntryVec) {
+    pub fn entries_sorted<'handle>(&'handle mut self) -> (EntryVec<'handle>, EntryVec<'handle>) {
         let (mut dirs, mut files) = self.entries(true, true);
         dirs.sort(Sorting::Ascending);
         files.sort(Sorting::Ascending);
@@ -874,13 +877,13 @@ methods for handling different types, in this case [[EntryExt]] structs.
 #[derive(Debug, Hash)]
 struct BufDeque<T>(VecDeque<T>);
 
-impl BufDeque<EntryExt> {
+impl<'h> BufDeque<EntryExt<'h>> {
     pub fn new(capacity: usize) -> Self {
         Self(VecDeque::with_capacity(capacity))
     }
 
     /// Push an entry to the buffer. Directories to the front, rest to back.
-    pub fn push(&mut self, entry: EntryExt) {
+    pub fn push(&mut self, entry: EntryExt<'h>) {
         if entry.is_dir() {
             self.push_front(entry);
         } else {
@@ -890,19 +893,19 @@ impl BufDeque<EntryExt> {
 
     /// Any directory entries in the buffer?
     pub fn has_dir(&self) -> bool {
-        self.iter().any(|entry: &EntryExt| entry.is_dir())
+        self.iter().any(|entry: &EntryExt<'h>| entry.is_dir())
     }
 
     /**
     Try to pop a directory entry. The first directory found is chosen,
     but if none are in the buffer, we pop the oldest (front) entry.
     */
-    pub fn try_pop_dir(&mut self) -> Option<EntryExt> {
+    pub fn try_pop_dir(&mut self) -> Option<EntryExt<'h>> {
         if self.is_empty() {
             return None;
         }
         self.iter()
-            .position(|entry: &EntryExt| entry.is_dir())
+            .position(|entry: &EntryExt<'h>| entry.is_dir())
             .map(|idx: usize| self.remove(idx))
             .unwrap_or_else(|| self.pop_front())
     }
@@ -910,7 +913,7 @@ impl BufDeque<EntryExt> {
 
 /* --------------------------------- */
 
-impl Default for BufDeque<EntryExt> {
+impl<'h> Default for BufDeque<EntryExt<'h>> {
     fn default() -> Self {
         Self::new(LOOKAHEAD_BUFFER_SIZE)
     }
@@ -936,14 +939,14 @@ impl<T> DerefMut for BufDeque<T> {
 #[derive(Debug)]
 pub struct DirHandleIter<'handle> {
     inner: Peekable<Iter<'handle>>,
-    dirfd: DirFd,
-    buf: BufDeque<EntryExt>,
+    dirfd: BorrowedFd<'handle>,
+    buf: BufDeque<EntryExt<'handle>>,
     state: &'handle mut DirectoryState,
     stat: bool,
     /// clones of dir entries - used for hashing
-    dirs: EntryVec,
+    dirs: EntryVec<'handle>,
     /// clones of file entries - used for hashing
-    files: EntryVec,
+    files: EntryVec<'handle>,
     /// resettable hasher for calculating entry hashes
     xxh: Option<CustomXxh3Hasher>,
 }
@@ -951,8 +954,16 @@ pub struct DirHandleIter<'handle> {
 impl<'handle> DirHandleIter<'handle> {
     pub fn new(handle: &'handle mut DirHandle, stat: bool) -> Self {
         let update: bool = handle.state.when.is_none();
+        let raw_fd: RawFd = handle.inner.as_raw_fd();
+        // SAFETY: the `&'handle mut DirHandle` borrow keeps `handle.inner`
+        // (a `nix::dir::Dir`) alive for `'handle`. The Dir owns the underlying
+        // fd and only closes it on drop, so the fd is valid for at least
+        // `'handle`. The `state: &'handle mut ...` field below extends the
+        // mut borrow for the whole iterator lifetime, which transitively
+        // keeps the Dir alive.
+        let dirfd: BorrowedFd<'handle> = unsafe { BorrowedFd::borrow_raw(raw_fd) };
         Self {
-            dirfd: handle.fd(),
+            dirfd,
             inner: handle.inner.iter().peekable(),
             buf: BufDeque::default(),
             state: &mut handle.state,
@@ -999,18 +1010,18 @@ impl<'handle> DirHandleIter<'handle> {
     }
 
     /// Get one entry from the inner iterator.
-    fn get_one(&mut self) -> Option<EntryExt> {
-        if let Some(entry) = next(&mut self.inner, &self.dirfd, self.stat) {
+    fn get_one(&mut self) -> Option<EntryExt<'handle>> {
+        if let Some(entry) = next(&mut self.inner, self.dirfd, self.stat) {
             if self.update() {
                 // store a clone of each entry for later use
-                let ec: EntryExt = entry.clone();
+                let ec: EntryExt<'handle> = entry.clone();
 
                 #[cfg(debug_assertions)]
                 {
                     use custom_xxh3::hash_item;
                     let mut xxh: &mut CustomXxh3Hasher = self.xxh.as_mut().unwrap();
                     ec.xxh3(&mut xxh);
-                    let vec: EntryVec = EnhVec::new_from(vec![entry.clone()]);
+                    let vec: EntryVec<'handle> = EnhVec::new_from(vec![entry.clone()]);
                     debug!(target: "get_one",
                 "{:?} : xxh3(entry): 0x{:x}, vec_digest: 0x{:x}, hash_item(entry): 0x{:x}, hash_item(vec): 0x{:x}",
                 entry.name(), xxh.reset(), vec.xxh3_digest(), hash_item(&entry), hash_item(&vec));
@@ -1043,7 +1054,7 @@ impl<'handle> DirHandleIter<'handle> {
 }
 
 impl<'handle> Iterator for DirHandleIter<'handle> {
-    type Item = EntryExt;
+    type Item = EntryExt<'handle>;
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
@@ -1128,10 +1139,10 @@ The lifetime parameter `'handle` is used to annotate that the entries
 in the Vec are only valid while the parent [DirHandle] object exists.
 */
 #[derive(Debug)]
-pub struct DirHandleIterSorted<'handle>(EntryVec, PhantomData<&'handle DirHandle>);
+pub struct DirHandleIterSorted<'handle>(EntryVec<'handle>, PhantomData<&'handle DirHandle>);
 
 impl<'handle> Iterator for DirHandleIterSorted<'handle> {
-    type Item = EntryExt;
+    type Item = EntryExt<'handle>;
 
     fn next(&mut self) -> Option<Self::Item> {
         self.0.pop()
@@ -1370,7 +1381,11 @@ determined (e.g. due to permission denied).
 If `stat == true`, we also `stat()` the entry before returning it.
 */
 #[instrument(level = "trace", skip(it))]
-fn next(it: &mut Peekable<Iter>, dirfd: &DirFd, stat: bool) -> Option<EntryExt> {
+fn next<'h>(
+    it: &mut Peekable<Iter<'h>>,
+    dirfd: BorrowedFd<'h>,
+    stat: bool,
+) -> Option<EntryExt<'h>> {
     it.filter_map(Result::ok)
         .filter_map(|entry| {
             // Sadly it appears that we cannot rely on the special "." and ".."
@@ -1381,9 +1396,9 @@ fn next(it: &mut Peekable<Iter>, dirfd: &DirFd, stat: bool) -> Option<EntryExt> 
             }
 
             // convert the [nix::dir::Entry] to our `EntryExt`
-            let entry: EntryExt = match stat {
-                false => EntryExt::new(entry, dirfd.clone()),
-                true => EntryExt::new_statted(entry, dirfd.clone()),
+            let entry: EntryExt<'h> = match stat {
+                false => EntryExt::new(entry, dirfd),
+                true => EntryExt::new_statted(entry, dirfd),
             };
             if let Some(_) = entry.file_type() {
                 trace!(target: "name", "{:?} : {:?}", entry.name(), entry);

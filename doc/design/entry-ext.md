@@ -1,6 +1,21 @@
 # EntryExt — enriched directory entry
 
-`EntryExt` wraps `nix::dir::Entry` and aims to feel like `std::fs::DirEntry` with a few additions. It is the unit yielded by every public iterator on `DirHandle`.
+`EntryExt<'h>` wraps `nix::dir::Entry` and aims to feel like `std::fs::DirEntry` with a few additions. It is the unit yielded by every public iterator on `DirHandle`.
+
+## Lifetime binding
+
+The `'h` parameter is the borrow on the parent `DirHandle`. Internally, `EntryExt` stores a `BorrowedFd<'h>` of the directory's file descriptor, not a snapshot. The borrow checker rejects code that holds an `EntryExt<'h>` past the lifetime of the underlying `DirHandle`:
+
+```rust
+let entries: Vec<EntryExt> = {
+    let mut h = DirHandle::new(path)?;
+    h.iter().collect()
+};  // ❌ borrow of `h` is still held by `entries` — won't compile
+```
+
+Collecting into a `Vec` keeps the mutable borrow on the `DirHandle` alive for the lifetime of the vec. To outlive the parent handle, an entry would have to be reconstructed from owned data (`Entry`, parent path), not carried as-is.
+
+This replaces an earlier design in which `EntryExt` held a cloned `DirFd` (independent `AtomicI32` snapshot), allowing zombie entries to survive past `DirHandle::drop` and silently issue `fstatat`/`openat2` against closed or reused fds.
 
 ## Cached stat
 
@@ -8,11 +23,11 @@ The entry holds an `OnceLock<Option<libc::stat>>`. `stat()` initialises it lazil
 
 `stat()` is the only path that can promote an entry's known type from `None` to something useful: when `dirent.d_type` is `DT_UNKNOWN` (some filesystems never populate it), `file_type()` falls back to `EntryType(self.mode()).entry_t()`. The local `EntryType` struct exists because `std::sys::pal::unix::fs::FileType`, which performs the same `S_IFMT` masking, is private and cannot be imported.
 
+Because the `BorrowedFd<'h>` guarantees the parent fd is alive for the entry's lifetime, `stat()` and `open()` do **not** need explicit liveness guards — the type system has already ruled out the closed-fd case for safe code paths.
+
 ## Safe `openat2`
 
 `read()` and `write()` open the entry via `nix::fcntl::openat2` with `ResolveFlag::RESOLVE_BENEATH`. The kernel rejects any path that would resolve outside the parent dirfd — symlink loops, `..` traversals, or absolute paths. Do not "simplify" this to plain `openat` or `open` without a deliberate reason; it silently broadens the trust boundary.
-
-Both `stat()` and `open()` early-return when `self.dirfd.is_open()` is false. This guard is the only thing keeping the `unsafe BorrowedFd::borrow_raw` in `DirFd::as_fd` sound — see [dirfd.md](dirfd.md).
 
 ## Hashing
 
