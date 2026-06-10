@@ -32,4 +32,6 @@ The interesting design decisions are split out under `doc/design/`. Read the rel
 
 - The `SizeOf` impls hard-code `DHSIZE = 296` from the layout of `nix::dir::Dir` + `libc::DIR` + `libc::dirent`. Re-verify if `nix` or `libc` changes representation.
 - `tracing` is used with explicit `target = "..."` strings throughout. Preserve targets when adding or moving log statements so downstream filters keep working.
-- `DirHandleIter` rewinds the inner `Dir` only when run to exhaustion. If a consumer drops the iterator early, the underlying `Dir` is left mid-stream and state tracking does not update for that pass.
+- nix's `Iter` rewinds the underlying `Dir` on drop (early or exhausted), so a partially-consumed `DirHandleIter` never leaves the `Dir` mid-stream. `DirectoryState` finalisation is stricter: it only happens on a clean, complete pass — early drops and `readdir` errors skip the state update.
+- Never delegate `EntryExt`'s `Hash`/`PartialEq` back to `nix::dir::Entry`'s derived impls: nix only initialises `d_reclen` bytes of the dirent, while the libc derives read the full struct including uninitialized `d_name` tail bytes.
+- `unsafe impl Sync for OpenHandles` is sound only while every `&self` method on `DirHandle` stays away from the underlying `DIR*` stream (no readdir/telldir/seekdir). Anything touching stream position must take `&mut self`.

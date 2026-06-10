@@ -1,6 +1,4 @@
-// Copyright (c) 2024-2025 Mikko Tanner. All rights reserved.
-
-#![allow(dead_code)]
+// Copyright (c) 2024-2026 Mikko Tanner. All rights reserved.
 
 use custom_xxh3::{CustomXxh3Hasher, Xxh3Hashable};
 use dashmap::{mapref::one::RefMut, DashMap};
@@ -9,6 +7,7 @@ use libc;
 use miniutils::{ToDebug, ToDisplay};
 use nix::{
     dir::{Dir, Entry, Iter, Type},
+    errno::Errno,
     fcntl::{openat2, AtFlags, OFlag, OpenHow, ResolveFlag},
     sys::stat::{fstatat, Mode},
 };
@@ -51,58 +50,43 @@ define our own `EntryType`, which is functionally a copy of the original
 #[derive(Debug, Clone, Copy, Hash)]
 pub struct EntryType(libc::mode_t);
 
+#[rustfmt::skip]
 impl EntryType {
     #[inline]
-    pub fn is_dir(&self) -> bool {
-        self.is(libc::S_IFDIR)
-    }
+    pub fn is_dir(&self)     -> bool { self.is(libc::S_IFDIR) }
     #[inline]
-    pub fn is_file(&self) -> bool {
-        self.is(libc::S_IFREG)
-    }
-    pub fn is_symlink(&self) -> bool {
-        self.is(libc::S_IFLNK)
-    }
-    pub fn is_block(&self) -> bool {
-        self.is(libc::S_IFBLK)
-    }
-    pub fn is_char(&self) -> bool {
-        self.is(libc::S_IFCHR)
-    }
-    pub fn is_sock(&self) -> bool {
-        self.is(libc::S_IFSOCK)
-    }
-    pub fn is_fifo(&self) -> bool {
-        self.is(libc::S_IFIFO)
-    }
+    pub fn is_file(&self)    -> bool { self.is(libc::S_IFREG) }
+    pub fn is_symlink(&self) -> bool { self.is(libc::S_IFLNK) }
+    pub fn is_block(&self)   -> bool { self.is(libc::S_IFBLK) }
+    pub fn is_char(&self)    -> bool { self.is(libc::S_IFCHR) }
+    pub fn is_sock(&self)    -> bool { self.is(libc::S_IFSOCK) }
+    pub fn is_fifo(&self)    -> bool { self.is(libc::S_IFIFO) }
 
     #[inline]
-    fn is(&self, mode: libc::mode_t) -> bool {
-        self.masked() == mode
-    }
+    fn is(&self, mode: libc::mode_t) -> bool { self.masked() == mode }
     #[inline]
-    fn masked(&self) -> libc::mode_t {
-        self.0 & libc::S_IFMT
-    }
+    fn masked(&self) -> libc::mode_t { self.0 & libc::S_IFMT }
 
     /// Return the file type of the entry as a [nix::dir::Type] enum.
     pub fn entry_t(&self) -> Option<Type> {
         match self.masked() {
-            libc::S_IFIFO => Some(Type::Fifo),
-            libc::S_IFCHR => Some(Type::CharacterDevice),
-            libc::S_IFDIR => Some(Type::Directory),
-            libc::S_IFBLK => Some(Type::BlockDevice),
-            libc::S_IFREG => Some(Type::File),
-            libc::S_IFLNK => Some(Type::Symlink),
+            libc::S_IFIFO  => Some(Type::Fifo),
+            libc::S_IFCHR  => Some(Type::CharacterDevice),
+            libc::S_IFDIR  => Some(Type::Directory),
+            libc::S_IFBLK  => Some(Type::BlockDevice),
+            libc::S_IFREG  => Some(Type::File),
+            libc::S_IFLNK  => Some(Type::Symlink),
             libc::S_IFSOCK => Some(Type::Socket),
             /* libc::DT_UNKNOWN | */ _ => None,
         }
     }
 }
 
-/// Sentinel for "uninitialized DirFd." Picked so it cannot collide with any
-/// real fd: the kernel only hands out non-negative values, and `i32::MIN` is
-/// distinct from every stale-fd encoding (see `clear()` below).
+/**
+Sentinel for "uninitialized DirFd." Picked so it cannot collide with any
+real fd: the kernel only hands out non-negative values, and `i32::MIN` is
+distinct from every stale-fd encoding (see `clear()` below).
+*/
 const UNINIT_FD: RawFd = i32::MIN;
 
 /**
@@ -241,26 +225,30 @@ impl Hash for DirFd {
 }
 
 impl AsFd for DirFd {
-    /// Returns a [BorrowedFd] view of the stored fd.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the `DirFd` is not in the "open" state (`is_open()` returns
-    /// false). `BorrowedFd::borrow_raw` forbids `-1` and requires the fd to
-    /// be open for the borrow's lifetime; passing a stale or uninitialized
-    /// value here would be undefined behaviour, so we choose a deterministic
-    /// panic over silent UB. Callers that may legitimately hold a closed
-    /// `DirFd` should test `is_open()` before invoking this method.
+    /**
+    Returns a [BorrowedFd] view of the stored fd.
+
+    # Panics
+
+    Panics if the `DirFd` is not in the "open" state (`is_open()` returns
+    false). `BorrowedFd::borrow_raw` forbids `-1` and requires the fd to
+    be open for the borrow's lifetime; passing a stale or uninitialized
+    value here would be undefined behaviour, so we choose a deterministic
+    panic over silent UB. Callers that may legitimately hold a closed
+    `DirFd` should test `is_open()` before invoking this method.
+    */
     fn as_fd(&'_ self) -> BorrowedFd<'_> {
         let fd: RawFd = self.fd();
         assert!(
             fd >= 0,
             "DirFd::as_fd called on closed or uninitialized DirFd (raw: {fd})",
         );
-        // SAFETY: We checked `fd >= 0`, satisfying the minimum precondition of
-        // `BorrowedFd::borrow_raw` (which forbids -1). Per-call OS-level
-        // openness of the fd remains the caller's responsibility, as documented
-        // on the method.
+        /*
+        SAFETY: We checked `fd >= 0`, satisfying the minimum precondition of
+        `BorrowedFd::borrow_raw` (which forbids -1). Per-call OS-level
+        openness of the fd remains the caller's responsibility, as documented
+        on the method.
+        */
         unsafe { BorrowedFd::borrow_raw(fd) }
     }
 }
@@ -471,16 +459,34 @@ impl<'h> EntryExt<'h> {
 
 /* --------------------------------- */
 
+/**
+NOTE: equality is defined over `(name, inode, parent dirfd)`. We must NOT
+delegate to `nix::dir::Entry`'s derived `PartialEq`: nix fills the dirent
+from `readdir_r` into a `MaybeUninit` buffer and only `d_reclen` bytes get
+copied, while libc's derived comparison reads the full 256-byte `d_name`
+array (plus `d_off`/`d_reclen`) — i.e. uninitialized garbage. The same
+logical entry read twice could compare unequal.
+*/
 impl<'h> PartialEq for EntryExt<'h> {
     fn eq(&self, other: &Self) -> bool {
-        self.entry == other.entry && self.dirfd.as_raw_fd() == other.dirfd.as_raw_fd()
+        self.name_as_bytes() == other.name_as_bytes()
+            && self.ino() == other.ino()
+            && self.dirfd.as_raw_fd() == other.dirfd.as_raw_fd()
     }
 }
 
 impl<'h> Ord for EntryExt<'h> {
+    /**
+    Primarily by name (which is unique within a directory); inode and
+    parent dirfd act as tie-breakers so the total order is consistent
+    with [PartialEq] — `cmp() == Equal` if and only if `eq()`.
+    */
     #[inline]
     fn cmp(&self, other: &Self) -> Ordering {
-        self.file_name().cmp(&other.file_name())
+        self.name_as_bytes()
+            .cmp(other.name_as_bytes())
+            .then_with(|| self.ino().cmp(&other.ino()))
+            .then_with(|| self.dirfd.as_raw_fd().cmp(&other.dirfd.as_raw_fd()))
     }
 }
 
@@ -501,15 +507,21 @@ impl<'h> Deref for EntryExt<'h> {
 /* --------------------------------- */
 
 impl<'h> Hash for EntryExt<'h> {
+    /**
+    Hashes `(name, inode)` — a subset of the [PartialEq] fields, so the
+    `Hash`/`Eq` contract holds. The dirfd is deliberately omitted: hashing
+    it would invalidate hashes whenever the directory is reopened under a
+    different fd. We must not delegate to `Entry`'s derived `Hash` either,
+    since that reads uninitialized dirent tail bytes (see [PartialEq]).
+
+    NOTE: this method will **not** produce stable hashes across processes
+    due to the standard `hash()` implementation's SipHash algorithm.
+    Use `xxh3()` instead.
+    */
     #[inline]
-    /// NOTE: this method will **not** produce stable hashes due to the standard
-    /// `hash()` implementation's SipHash algorithm. Use `xxh3()` instead.
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.entry.hash(state);
-        // TODO: should we hash the dirfd as well? If we do, we invalidate
-        // the hash most likely if we close the directory and open it again.
-        // Needs testing.
-        //self.dirfd.hash(state);
+        self.name_as_bytes().hash(state);
+        self.ino().hash(state);
     }
 }
 
@@ -543,10 +555,10 @@ pub enum StateChange {
     Unchanged,
     /// Directory count change: positive = directories added since the previous
     /// snapshot, negative = removed.
-    DirNum(i32),
+    DirNum(i64),
     /// File count change: positive = files added since the previous snapshot,
     /// negative = removed.
-    FileNum(i32),
+    FileNum(i64),
     /// Same directory count, but hash of dir entries has changed
     DirHash,
     /// Same file count, but hash of file entries has changed
@@ -594,10 +606,10 @@ impl DirectoryState {
     */
     pub fn change(&self, other: &Self) -> StateChange {
         if self.dirs != other.dirs {
-            return StateChange::DirNum(other.dirs as i32 - self.dirs as i32);
+            return StateChange::DirNum(other.dirs as i64 - self.dirs as i64);
         }
         if self.files != other.files {
-            return StateChange::FileNum(other.files as i32 - self.files as i32);
+            return StateChange::FileNum(other.files as i64 - self.files as i64);
         }
         if self.hash_d != other.hash_d {
             return StateChange::DirHash;
@@ -638,9 +650,11 @@ impl PartialEq for DirectoryState {
 }
 
 impl Hash for DirectoryState {
-    /// `when` is excluded to uphold the `Hash`/`Eq` contract: [PartialEq]
-    /// above compares only the content fields, so equal states must produce
-    /// equal hashes regardless of when their snapshots were taken.
+    /**
+    `when` is excluded to uphold the `Hash`/`Eq` contract: [PartialEq]
+    above compares only the content fields, so equal states must produce
+    equal hashes regardless of when their snapshots were taken.
+    */
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.dirs.hash(state);
         self.files.hash(state);
@@ -744,17 +758,30 @@ impl DirHandle {
         &self.state
     }
 
-    /// Current state of the directory as a [DirectoryState] object.
-    pub fn state_current(&mut self) -> DirectoryState {
+    /**
+    Current state of the directory as a [DirectoryState] object.
+
+    Does **not** touch the stored state — use `state_changed()` for that.
+    Returns an error if a `readdir` failure cuts the listing short, since
+    a partial listing must not masquerade as the directory's state.
+    */
+    pub fn state_current(&mut self) -> io::Result<DirectoryState> {
         directory_state(self)
     }
 
-    /// Whether the state has changed. Also updates the stored state if so.
-    pub fn state_changed(&mut self) -> bool {
-        let current: DirectoryState = self.state_current();
+    /**
+    Whether the state has changed. Also updates the stored state if so.
+
+    The first call (or the first after an error) establishes the baseline
+    and returns `false`. On a `readdir` error the stored state is left
+    untouched, so a failed pass cannot corrupt the baseline.
+    */
+    pub fn state_changed(&mut self) -> io::Result<bool> {
+        let first: bool = self.state.when.is_none();
+        let current: DirectoryState = self.state_current()?;
         let changed: StateChange = self.state.change(&current);
         self.state.update(current);
-        !changed.is_same()
+        Ok(!first && !changed.is_same())
     }
 
     /**
@@ -797,6 +824,9 @@ impl DirHandle {
     - rewinds after finishing
     - maintains a lookahead buffer to preferentially return directory
       entries before other entries (NOTE: not a guarantee)
+    - yields entries even when their file type cannot be determined
+      (`file_type()` returns `None`); the heuristic treats them as files
+    - stops at the first `readdir` error (see `DirHandleIter::error()`)
     */
     pub fn iter(&'_ mut self) -> DirHandleIter<'_> {
         DirHandleIter::new(self, false)
@@ -807,8 +837,11 @@ impl DirHandle {
         DirHandleIter::new(self, true)
     }
 
-    /// Return the directory entries as a tuple of directories and files.
-    /// The booleans specify whether to include directories and/or files.
+    /**
+    Return the directory entries as a tuple of directories and files.
+    The booleans specify whether to include directories and/or files.
+    Entries whose type cannot be determined count as files (non-dirs).
+    */
     pub fn entries<'handle>(
         &'handle mut self,
         dirs: bool,
@@ -823,12 +856,11 @@ impl DirHandle {
                         d_vec.push(entry)
                     }
                 }
-                Some(_) => {
+                _ => {
                     if files {
                         f_vec.push(entry)
                     }
                 }
-                None => {} // ignore unknown file types
             }
         });
         (d_vec, f_vec)
@@ -885,9 +917,19 @@ impl AsRawFd for DirHandle {
     }
 }
 
-// DirHandle can be Send, since the underlying nix::dir::Dir is Send as well.
-unsafe impl Send for DirHandle {}
+/*
+DirHandle is automatically Send (nix::dir::Dir is explicitly Send, the
+rest of the fields are plain data), so no `unsafe impl` is needed — and
+having one would silently mask a future non-Send field. This assertion
+keeps the requirement checked at compile time: [OpenHandles] shares
+handles across threads and needs `DirHandle: Send`.
+*/
+const _: () = {
+    const fn assert_send<T: Send>() {}
+    assert_send::<DirHandle>();
+};
 
+#[cfg(feature = "size_of")]
 const DHSIZE: usize = 296;
 
 #[cfg(feature = "size_of")]
@@ -908,26 +950,41 @@ impl SizeOf for DirHandle {
 A wrapper around [std::collections::VecDeque] that provides additional
 methods for handling different types, in this case [[EntryExt]] structs.
 */
-#[derive(Debug, Hash)]
-struct BufDeque<T>(VecDeque<T>);
+#[derive(Debug)]
+struct BufDeque<T> {
+    q: VecDeque<T>,
+    /**
+    Number of directory entries currently buffered. Lets `try_pop_dir`
+    skip the linear scan in the (common) all-files case. The counter
+    stays in sync because `is_dir()` is stable per entry — `d_type` is
+    fixed and the stat fallback result is cached — and all mutation
+    goes through `push` / `try_pop_dir` (no `DerefMut` escape hatch).
+    */
+    n_dirs: usize,
+}
 
 impl<'h> BufDeque<EntryExt<'h>> {
     pub fn new(capacity: usize) -> Self {
-        Self(VecDeque::with_capacity(capacity))
+        Self {
+            q: VecDeque::with_capacity(capacity),
+            n_dirs: 0,
+        }
     }
 
     /// Push an entry to the buffer. Directories to the front, rest to back.
     pub fn push(&mut self, entry: EntryExt<'h>) {
         if entry.is_dir() {
-            self.push_front(entry);
+            self.q.push_front(entry);
+            self.n_dirs += 1;
         } else {
-            self.push_back(entry);
+            self.q.push_back(entry);
         }
     }
 
     /// Any directory entries in the buffer?
+    #[expect(dead_code)]
     pub fn has_dir(&self) -> bool {
-        self.iter().any(|entry: &EntryExt<'h>| entry.is_dir())
+        self.n_dirs > 0
     }
 
     /**
@@ -935,13 +992,21 @@ impl<'h> BufDeque<EntryExt<'h>> {
     but if none are in the buffer, we pop the oldest (front) entry.
     */
     pub fn try_pop_dir(&mut self) -> Option<EntryExt<'h>> {
-        if self.is_empty() {
-            return None;
+        if self.n_dirs == 0 {
+            return self.q.pop_front();
         }
-        self.iter()
-            .position(|entry: &EntryExt<'h>| entry.is_dir())
-            .map(|idx: usize| self.remove(idx))
-            .unwrap_or_else(|| self.pop_front())
+        match self.q.iter().position(|entry: &EntryExt<'h>| entry.is_dir()) {
+            // directories are pushed to the front, so idx is almost always 0
+            Some(idx) => {
+                self.n_dirs -= 1;
+                self.q.remove(idx)
+            }
+            None => {
+                // fail-safe: counter desynced (should not be possible)
+                self.n_dirs = 0;
+                self.q.pop_front()
+            }
+        }
     }
 }
 
@@ -957,13 +1022,7 @@ impl<T> Deref for BufDeque<T> {
     type Target = VecDeque<T>;
 
     fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl<T> DerefMut for BufDeque<T> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
+        &self.q
     }
 }
 
@@ -977,24 +1036,34 @@ pub struct DirHandleIter<'handle> {
     buf: BufDeque<EntryExt<'handle>>,
     state: &'handle mut DirectoryState,
     stat: bool,
-    /// clones of dir entries - used for hashing
-    dirs: EntryVec<'handle>,
-    /// clones of file entries - used for hashing
-    files: EntryVec<'handle>,
-    /// resettable hasher for calculating entry hashes
-    xxh: Option<CustomXxh3Hasher>,
+    /// shall we finalize the [DirectoryState] when the pass completes?
+    update: bool,
+    /// per-entry xxh3 digests of dir entries - used for state hashing
+    dirs: Vec<u64>,
+    /// per-entry xxh3 digests of file entries - used for state hashing
+    files: Vec<u64>,
 }
 
 impl<'handle> DirHandleIter<'handle> {
     pub fn new(handle: &'handle mut DirHandle, stat: bool) -> Self {
+        // lazy one-shot state population: only the first complete pass
+        // over a handle computes the DirectoryState
         let update: bool = handle.state.when.is_none();
+        Self::with_update(handle, stat, update)
+    }
+
+    /// Like `new()`, but with explicit control over whether this pass
+    /// finalizes the [DirectoryState] of the parent handle.
+    fn with_update(handle: &'handle mut DirHandle, stat: bool, update: bool) -> Self {
         let raw_fd: RawFd = handle.inner.as_raw_fd();
-        // SAFETY: the `&'handle mut DirHandle` borrow keeps `handle.inner`
-        // (a `nix::dir::Dir`) alive for `'handle`. The Dir owns the underlying
-        // fd and only closes it on drop, so the fd is valid for at least
-        // `'handle`. The `state: &'handle mut ...` field below extends the
-        // mut borrow for the whole iterator lifetime, which transitively
-        // keeps the Dir alive.
+        /*
+        SAFETY: the `&'handle mut DirHandle` borrow keeps `handle.inner`
+        (a `nix::dir::Dir`) alive for `'handle`. The Dir owns the underlying
+        fd and only closes it on drop, so the fd is valid for at least
+        `'handle`. The `state: &'handle mut ...` field below extends the
+        mut borrow for the whole iterator lifetime, which transitively
+        keeps the Dir alive.
+        */
         let dirfd: BorrowedFd<'handle> = unsafe { BorrowedFd::borrow_raw(raw_fd) };
         Self {
             dirfd,
@@ -1002,18 +1071,10 @@ impl<'handle> DirHandleIter<'handle> {
             buf: BufDeque::default(),
             state: &mut handle.state,
             stat,
-            dirs: EntryVec::new(),
-            files: EntryVec::new(),
-            xxh: match update {
-                true => Some(CustomXxh3Hasher::default()),
-                false => None,
-            },
+            update,
+            dirs: Vec::new(),
+            files: Vec::new(),
         }
-    }
-
-    /// Shall we update the [DirectoryState] struct after iter is done?
-    fn update(&mut self) -> bool {
-        self.xxh.is_some()
     }
 
     /// Is the inner iterator done? A sticky `readdir` error (see [next])
@@ -1023,10 +1084,18 @@ impl<'handle> DirHandleIter<'handle> {
         matches!(self.inner.peek(), None | Some(Err(_)))
     }
 
+    /// The `readdir` error that ended this pass early, if any.
+    pub fn error(&mut self) -> Option<Errno> {
+        match self.inner.peek() {
+            Some(Err(e)) => Some(*e),
+            _ => None,
+        }
+    }
+
     /// Did the inner iterator stop early due to a `readdir` error?
     #[inline]
     fn errored(&mut self) -> bool {
-        matches!(self.inner.peek(), Some(Err(_)))
+        self.error().is_some()
     }
 
     /**
@@ -1052,32 +1121,24 @@ impl<'handle> DirHandleIter<'handle> {
 
     /// Get one entry from the inner iterator.
     fn get_one(&mut self) -> Option<EntryExt<'handle>> {
-        if let Some(entry) = next(&mut self.inner, self.dirfd, self.stat) {
-            if self.update() {
-                // store a clone of each entry for later use
-                let ec: EntryExt<'handle> = entry.clone();
+        let entry: EntryExt<'handle> = next(&mut self.inner, self.dirfd, self.stat)?;
+        if self.update {
+            // store the entry's stable digest for state hashing — 8 bytes
+            // per entry instead of cloning the whole EntryExt, which kept
+            // the full listing in memory until the pass completed
+            let digest: u64 = entry.xxh3_digest();
 
-                #[cfg(debug_assertions)]
-                {
-                    use custom_xxh3::hash_item;
-                    let mut xxh: &mut CustomXxh3Hasher = self.xxh.as_mut().unwrap();
-                    ec.xxh3(&mut xxh);
-                    let vec: EntryVec<'handle> = EnhVec::new_from(vec![entry.clone()]);
-                    debug!(target: "get_one",
-                "{:?} : xxh3(entry): 0x{:x}, vec_digest: 0x{:x}, hash_item(entry): 0x{:x}, hash_item(vec): 0x{:x}",
-                entry.name(), xxh.reset(), vec.xxh3_digest(), hash_item(&entry), hash_item(&vec));
-                } // END DEBUG
+            #[cfg(debug_assertions)]
+            debug!(target: "get_one", "{:?} : ino {} : xxh3_digest: 0x{digest:x}",
+                entry.name(), entry.ino());
 
-                match entry.file_type() {
-                    Some(Type::Directory) => self.dirs.push(ec),
-                    Some(_) => self.files.push(ec),
-                    None => {} // unknown file type
-                }
+            match entry.file_type() {
+                Some(Type::Directory) => self.dirs.push(digest),
+                // files, special files and unknown types all count as files
+                _ => self.files.push(digest),
             }
-            Some(entry)
-        } else {
-            None
         }
+        Some(entry)
     }
 
     /// Fill the lookahead buffer with entries.
@@ -1144,31 +1205,22 @@ impl<'handle> Iterator for DirHandleIter<'handle> {
             } else if self.done() {
                 debug!(target: "DirHandleIter::next", "iter_done: {:?}", self.inner);
                 if self.errored() {
-                    // the listing is incomplete, so we must not finalize the
-                    // DirectoryState from partial data; `when` stays as-is and
-                    // a later full pass will compute the state instead.
+                    /*
+                    the listing is incomplete, so we must not finalize the
+                    DirectoryState from partial data; `when` stays as-is and
+                    a later full pass will compute the state instead.
+                    */
                     warn!(target: "DirHandleIter::next",
-                        "readdir error ended iteration early, state not updated: {:?}",
+                        "readdir error ended iteration early (listing incomplete): {:?}",
                         self.inner.peek());
                     return None;
                 }
-                if self.update() {
-                    // hash the sorted entries and set DirHandle state
-                    let mut xxh: CustomXxh3Hasher = self.xxh.take().unwrap();
-                    xxh.reset(); // just in case...
-
-                    self.dirs.as_sorted_asc().iter().for_each(|entry| {
-                        entry.xxh3(&mut xxh);
-                    });
-                    self.state.hash_d = xxh.reset();
-
-                    self.files.as_sorted_asc().iter().for_each(|entry| {
-                        entry.xxh3(&mut xxh);
-                    });
-                    self.state.hash_f = xxh.finish();
-
+                if self.update {
+                    self.update = false;
                     self.state.dirs = self.dirs.len();
                     self.state.files = self.files.len();
+                    self.state.hash_d = digest_of_digests(std::mem::take(&mut self.dirs));
+                    self.state.hash_f = digest_of_digests(std::mem::take(&mut self.files));
                     self.state.when = TimeSinceEpoch::new().into();
                     trace!(target: "DirHandle.state", "{:?}", self.state);
                 }
@@ -1257,11 +1309,13 @@ impl OpenHandles {
         let handle: DirHandle = DirHandle::new(path)?;
         let fd: RawFd = handle.as_raw_fd();
         self.0.insert(fd, handle);
-        // Between the insert above and the checkout below, another thread on
-        // this same OpenHandles could call close(fd) and evict our just-opened
-        // handle. The fd value is freshly allocated by the kernel and the
-        // race is exceedingly rare, but turning it into io::Error is cheap and
-        // strictly better than panicking inside a library entry point.
+        /*
+        Between the insert above and the checkout below, another thread on
+        this same OpenHandles could call close(fd) and evict our just-opened
+        handle. The fd value is freshly allocated by the kernel and the
+        race is exceedingly rare, but turning it into io::Error is cheap and
+        strictly better than panicking inside a library entry point.
+        */
         self.checkout(fd).ok_or_else(|| {
             io::Error::other("handle closed concurrently between insert and checkout")
         })
@@ -1329,7 +1383,19 @@ impl OpenHandles {
     }
 }
 
-// OpenHandles is thread-safe due to the internal DashMap being thread-safe.
+/*
+SAFETY: DashMap<RawFd, DirHandle> is not auto-Sync because DirHandle is
+!Sync (nix::dir::Dir is deliberately !Sync — readdir on a shared DIR*
+races). Sharing &OpenHandles is still sound because DashMap's per-shard
+RwLock makes &mut DirHandle access (checkout / for_each_mut) exclusive,
+and concurrent shared access (for_each / iter) only reaches `&self`
+methods of DirHandle — fd(), path(), state(), as_raw_fd(), Hash, Eq —
+none of which touch the underlying DIR* stream state.
+
+INVARIANT: keep it that way. Any future `&self` method on DirHandle
+that reads or moves the DIR* position (readdir/telldir/seekdir/...)
+silently breaks this impl and must take `&mut self` instead.
+*/
 unsafe impl Sync for OpenHandles {}
 
 #[cfg(feature = "size_of")]
@@ -1363,14 +1429,25 @@ handle is closed and its file descriptor released when dropped).
 */
 pub struct CheckedOutHandle<'a> {
     inner: RefMut<'a, RawFd, DirHandle>,
-    // Using `Rc` instead of `Arc` here is deliberate because we don't want to
-    // share the callback between threads and this also disallows moving a
-    // checked-out handle to another thread.
+    /*
+    Using `Rc` instead of `Arc` here is deliberate because we don't want to
+    share the callback between threads and this also disallows moving a
+    checked-out handle to another thread.
+    */
     close_callback: Rc<dyn Fn(RawFd) + 'a>,
 }
 
 impl<'a> CheckedOutHandle<'a> {
-    /// Close this [DirHandle] and release its file descriptor.
+    /**
+    Close this [DirHandle] and release its file descriptor.
+
+    NOTE: the internal lock must be released before removing the entry
+    (see the deadlock caveat on [OpenHandles]), which opens a tiny
+    window where another thread may close this fd and the kernel may
+    recycle the number for a freshly opened handle — in that case the
+    new entry gets evicted instead. Same fd-reuse caveat as documented
+    on `OpenHandles::open`.
+    */
     pub fn close(self) {
         let fd: i32 = *self.inner.key();
         drop(self.inner); // explicitly drop the RefMut
@@ -1420,38 +1497,82 @@ fn proc_fd_path(fd: RawFd) -> io::Result<PathBuf> {
 
 /// Open a directory and return its handle.
 fn get_dir_handle(path: &Path) -> io::Result<Dir> {
-    // - O_DIRECTORY: fail with ENOTDIR up front instead of e.g. blocking
-    //   forever on a FIFO before `fdopendir` gets a chance to reject it.
-    // - O_CLOEXEC: don't leak directory fds to exec'd children.
-    // - O_NONBLOCK: belt-and-suspenders against blocking opens (matches
-    //   what std::fs::ReadDir passes to open(2)).
+    /*
+    - O_DIRECTORY: fail with ENOTDIR up front instead of e.g. blocking
+      forever on a FIFO before `fdopendir` gets a chance to reject it.
+    - O_CLOEXEC: don't leak directory fds to exec'd children.
+    - O_NONBLOCK: belt-and-suspenders against blocking opens (matches
+      what std::fs::ReadDir passes to open(2)).
+    */
     let flags: OFlag =
         OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC | OFlag::O_NONBLOCK;
     Ok(Dir::open(path, flags, Mode::empty())?)
 }
 
 /// Open a file and return its handle.
+#[expect(dead_code)]
 fn get_file_handle(path: &Path) -> io::Result<File> {
     Ok(OpenOptions::new().read(true).open(path)?)
 }
 
-/// Return the state of a directory as a [DirectoryState] object.
+/**
+Combine per-entry xxh3 digests into a single stable digest. Sorting the
+digests makes the result independent of `readdir` order; the per-entry
+digests already cover `(name, inode, typenum)`, so the same set of
+entries always produces the same combined digest.
+
+This is the single source of truth for [DirectoryState] hashing — both
+the lazy in-iterator computation and `directory_state()` go through it,
+which keeps the two paths comparable.
+*/
+fn digest_of_digests(mut digests: Vec<u64>) -> u64 {
+    digests.sort_unstable();
+    let mut xxh: CustomXxh3Hasher = CustomXxh3Hasher::default();
+    digests.iter().for_each(|d: &u64| xxh.write_u64(*d));
+    xxh.finish()
+}
+
+/**
+Return the state of a directory as a [DirectoryState] object.
+
+This pass never finalizes the handle's stored state (that side effect
+belongs to `DirHandle::state_changed`), and only accumulates 8 bytes per
+entry instead of materializing the listing. A `readdir` error ends the
+listing early, in which case we return the error instead of a partial
+(and therefore wrong) state.
+*/
 #[instrument(level = "trace", skip_all, ret)]
-fn directory_state(dir: &mut DirHandle) -> DirectoryState {
-    let (dirs, files) = dir.entries_sorted();
-    DirectoryState {
-        dirs: dirs.len(),
-        files: files.len(),
-        hash_d: dirs.xxh3_digest(),
-        hash_f: files.xxh3_digest(),
-        when: TimeSinceEpoch::new().into(),
+fn directory_state(dir: &mut DirHandle) -> io::Result<DirectoryState> {
+    let mut d_digests: Vec<u64> = Vec::new();
+    let mut f_digests: Vec<u64> = Vec::new();
+    let mut iter: DirHandleIter = DirHandleIter::with_update(dir, false, false);
+    for entry in iter.by_ref() {
+        match entry.file_type() {
+            Some(Type::Directory) => d_digests.push(entry.xxh3_digest()),
+            _ => f_digests.push(entry.xxh3_digest()),
+        }
     }
+    if let Some(errno) = iter.error() {
+        return Err(io::Error::from_raw_os_error(errno as i32));
+    }
+    Ok(DirectoryState {
+        dirs: d_digests.len(),
+        files: f_digests.len(),
+        hash_d: digest_of_digests(d_digests),
+        hash_f: digest_of_digests(f_digests),
+        when: TimeSinceEpoch::new().into(),
+    })
 }
 
 /**
 Return the next entry from the inner [nix::dir::Iter] as an [EntryExt],
-skipping `.` and `..`. Also skips entries where the file type cannot be
-determined (e.g. due to permission denied).
+skipping `.` and `..`.
+
+Entries whose file type cannot be determined (`d_type` is `DT_UNKNOWN`
+and the `fstatat` fallback fails, e.g. due to permission denied) are
+yielded too — their `file_type()` returns `None` and the caller decides
+what to do. Silently dropping them would make a listable-but-unsearchable
+directory iterate as empty on filesystems that don't populate `d_type`.
 
 A `readdir` error ends the iteration: a persistent error (e.g. `ESTALE`
 on NFS, `EIO`) would otherwise be skipped forever and spin this loop. The
@@ -1489,12 +1610,7 @@ fn next<'h>(
             false => EntryExt::new(entry, dirfd),
             true => EntryExt::new_statted(entry, dirfd),
         };
-        if entry.file_type().is_some() {
-            trace!(target: "name", "{:?} : {:?}", entry.name(), entry);
-            return Some(entry);
-        }
-        // we ignore the entry if we can't determine its type
-        // (e.g. permission denied, unknown type)
-        trace!(target: "name", "{:?} : {:?} (skipping, no type)", entry.name(), entry);
+        trace!(target: "name", "{:?} : {:?}", entry.name(), entry);
+        return Some(entry);
     }
 }

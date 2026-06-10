@@ -29,11 +29,13 @@ Because the `BorrowedFd<'h>` guarantees the parent fd is alive for the entry's l
 
 `read()` and `write()` open the entry via `nix::fcntl::openat2` with `ResolveFlag::RESOLVE_BENEATH`. The kernel rejects any path that would resolve outside the parent dirfd — symlink loops, `..` traversals, or absolute paths. Do not "simplify" this to plain `openat` or `open` without a deliberate reason; it silently broadens the trust boundary. `O_CLOEXEC` is unconditionally OR'd into the flags so the opened file descriptors do not leak into exec'd children (directory fds opened by `get_dir_handle` get the same treatment, plus `O_DIRECTORY | O_NONBLOCK`).
 
-## Hashing
+## Equality, ordering, hashing
 
-`EntryExt` implements two distinct hash protocols:
+`Eq`, `Ord` and `Hash` are all defined over explicit field tuples — **never** delegated to `nix::dir::Entry`'s derived impls. nix fills the dirent from `readdir_r` into a `MaybeUninit` buffer and only `d_reclen` bytes are copied, while the libc derives compare/hash the entire struct including `d_off`, `d_reclen` and the uninitialized tail of the 256-byte `d_name` array. Delegating would make the same logical entry compare unequal (and hash differently) between two reads within one process.
 
-- `std::hash::Hash` — delegates to `Entry::hash` (SipHash via the default hasher). Not stable across processes; not safe for persistence. The `dirfd` is **deliberately omitted** from the hash — including it would invalidate hashes whenever the directory is reopened with a different fd. The in-source TODO acknowledges this is worth re-examining.
+- `PartialEq`/`Eq` — `(name_bytes, ino, parent dirfd)`.
+- `Ord` — name first (unique within a directory, so sorting behaviour is name-order), with ino and dirfd as tie-breakers so that `cmp() == Equal ⇔ eq()`. Keep these two consistent; sorted-collection invariants depend on it.
+- `std::hash::Hash` — `(name_bytes, ino)`, a subset of the `Eq` fields (equal entries hash equal). SipHash via the default hasher: not stable across processes; not safe for persistence. The `dirfd` is **deliberately omitted** — including it would invalidate hashes whenever the directory is reopened with a different fd.
 - `custom_xxh3::Xxh3Hashable` — stable, hashes `(name_bytes, inode, typenum)`. This is the hash used for `DirectoryState` change detection, where stability across reopens is the whole point. See [state-tracking.md](state-tracking.md).
 
 ## `Deref<Target = Entry>`

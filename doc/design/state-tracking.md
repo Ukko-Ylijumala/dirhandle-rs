@@ -5,19 +5,23 @@ Each `DirHandle` carries a `DirectoryState` snapshot:
 | Field    | Meaning |
 | -------- | ------- |
 | `dirs`   | Count of directory entries (excluding `.`/`..`). |
-| `files`  | Count of non-directory entries. |
-| `hash_d` | Stable xxh3 hash of the sorted directory entries. |
-| `hash_f` | Stable xxh3 hash of the sorted non-directory entries. |
+| `files`  | Count of non-directory entries, **including** entries whose type could not be determined. |
+| `hash_d` | Stable combined xxh3 digest of the directory entries. |
+| `hash_f` | Stable combined xxh3 digest of the non-directory entries. |
 | `when`   | Timestamp of the most recent snapshot, or `None` if never populated. |
+
+`when` participates in neither `PartialEq` nor `Hash` — two snapshots with identical content compare (and hash) equal regardless of when they were taken.
 
 ## When state is computed
 
-State population is **lazy and one-shot per handle** by default. `DirHandleIter::new` sets its internal `xxh` to `Some(...)` only when `state.when.is_none()` — i.e., the very first time the handle is iterated. Subsequent calls to `iter()` do **not** refresh the state, even if the directory has changed externally.
+State population is **lazy and one-shot per handle** by default. `DirHandleIter::new` enables its `update` flag only when `state.when.is_none()` — i.e., the very first time the handle is iterated. Subsequent calls to `iter()` do **not** refresh the state, even if the directory has changed externally. Only a clean, complete pass finalises the state: early drops and `readdir` errors skip the update.
 
 To force a refresh:
 
-- `state_current()` — returns a fresh `DirectoryState` without touching the stored one.
-- `state_changed()` — computes fresh, compares, updates stored if different, returns a bool.
+- `state_current()` — returns a fresh `DirectoryState` without touching the stored one. It iterates with `update` explicitly off, so it has no side effect even on a never-iterated handle.
+- `state_changed()` — computes fresh, compares, updates stored, returns a bool. The **first call establishes the baseline and returns `false`**.
+
+Both return `io::Result`: a `readdir` error ending the listing early surfaces as the error instead of a partial listing masquerading as the directory's state. On error the stored baseline is left untouched.
 
 This is a deliberate trade-off: most callers iterate to consume entries, not to recompute hashes on every pass. If you add a new iteration entry point, decide explicitly whether it should participate in state tracking and follow the existing pattern.
 
@@ -35,7 +39,9 @@ Because the comparison short-circuits, a `DirNum`/`FileNum` result also implies 
 
 ## Hash stability
 
-Hashes are computed over entries **sorted ascending** before feeding the hasher (see the finalisation block at the end of `DirHandleIter::next`). Stability across reopens is provided by `EntryExt::xxh3` hashing `(name_bytes, ino, typenum)` and explicitly **not** the dirfd — see [entry-ext.md](entry-ext.md). This means a handle closed and reopened against the same directory produces identical hashes if the contents are unchanged.
+Each entry contributes its per-entry `xxh3_digest()` (a `u64` over `(name_bytes, ino, typenum)`, explicitly **not** the dirfd — see [entry-ext.md](entry-ext.md)); the digests are then **sorted** and fed into one final hasher by `digest_of_digests()`. Sorting makes the result independent of `readdir` order, and accumulating 8 bytes per entry (rather than cloning every `EntryExt` until the pass completes, as earlier versions did) keeps memory flat for huge directories. `digest_of_digests()` is the single source of truth — both the lazy in-iterator finalisation and `directory_state()` go through it, so the two paths always produce comparable values.
+
+A handle closed and reopened against the same directory produces identical hashes if the contents are unchanged. Note that the digest *scheme* changed in v0.4.0 (sorted per-entry digests instead of hashing name-sorted entries in sequence): hash values are stable going forward but do not match those produced by earlier versions.
 
 ## `hash_all()`
 

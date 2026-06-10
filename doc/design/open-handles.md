@@ -27,7 +27,9 @@ The simplest discipline: drop or `close()` the current checkout before requestin
 
 ## Lifecycle
 
-`CheckedOutHandle::close(self)` explicitly drops the `RefMut` before invoking the close callback. This ordering matters: the callback calls `OpenHandles::close(fd)`, which itself acquires a write lock, so the existing `RefMut` must be released first or you hit the same deadlock pattern described above.
+`CheckedOutHandle::close(self)` explicitly drops the `RefMut` before invoking the close callback. This ordering matters: the callback calls `OpenHandles::close(fd)`, which itself acquires a write lock, so the existing `RefMut` must be released first or you hit the same deadlock pattern described above. The unlock-then-remove sequence opens a tiny fd-reuse window (another thread closes the fd, the kernel recycles the number for a fresh handle, and the remove evicts the newcomer) — the same race family as documented on `open()`; both are inherent to keying the pool by `RawFd`.
+
+The map being keyed by `RawFd` also means the pool is sound only while each entry's fd number is owned by its `DirHandle`'s inner `Dir` — which `Dir` guarantees (it closes the fd only on drop, i.e. on removal from the map).
 
 Dropping a `CheckedOutHandle` without calling `close()` simply releases the lock — the handle stays in the pool, and the directory remains open.
 

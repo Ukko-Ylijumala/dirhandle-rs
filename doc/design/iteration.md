@@ -2,6 +2,10 @@
 
 `DirHandle` exposes three iteration entry points plus a low-level escape hatch. All of them filter out `.` and `..` and yield `EntryExt`.
 
+Entries whose file type cannot be determined (`d_type` is `DT_UNKNOWN` and the `fstatat` fallback fails) are **yielded, not dropped** — their `file_type()` returns `None` and they classify as non-directories everywhere (lookahead heuristic, `entries()`, state counts/hashes). Dropping them would make a listable-but-unsearchable directory iterate as empty on filesystems that don't populate `d_type`.
+
+On such `d_type`-less filesystems (some XFS configurations, NFS, FAT), note that plain `iter()` effectively degrades to `iter_stat()`: the dir-first heuristic and the type classification have to `fstatat` each entry once to decide. The result is cached per entry, but the cost is one syscall per entry either way.
+
 ## Public surface
 
 - `iter()` — lookahead-buffered iterator that **preferentially** yields directory entries before others. Rewinds the inner `nix::dir::Iter` when exhausted, so the handle can be iterated repeatedly.
@@ -27,9 +31,9 @@ A `readdir` error terminates the pass. Errors must **not** be skipped-and-contin
 
 ## Rewind semantics
 
-When the inner iterator is exhausted, `DirHandleIter::next` returns `None` after (a) optionally finalising `DirectoryState` (see [state-tracking.md](state-tracking.md)) and (b) leaving the inner `Dir` rewound for the next iteration.
+nix's `Iter` rewinds the underlying `Dir` (via `rewinddir`) in its `Drop` impl — unconditionally, whether the iterator was exhausted or dropped early. A partially-consumed `DirHandleIter` therefore does **not** leave the `Dir` mid-stream; the next `iter()` call always starts from the beginning.
 
-If the consumer drops the iterator before exhaustion, the underlying `Dir` is left mid-stream — there is no rewind-on-drop. State tracking, if it was going to update on this pass, will not update either.
+`DirectoryState` finalisation is stricter than rewinding: it only happens when a pass runs to clean exhaustion. Dropping the iterator early, or a `readdir` error ending the pass, skips the state update (`when` stays `None`), so a later complete pass computes it instead.
 
 ## Thread-safety
 
