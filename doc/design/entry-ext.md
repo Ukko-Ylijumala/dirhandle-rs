@@ -29,6 +29,10 @@ Because the `BorrowedFd<'h>` guarantees the parent fd is alive for the entry's l
 
 `read()` and `write()` open the entry via `nix::fcntl::openat2` with `ResolveFlag::RESOLVE_BENEATH`. The kernel rejects any path that would resolve outside the parent dirfd — symlink loops, `..` traversals, or absolute paths. Do not "simplify" this to plain `openat` or `open` without a deliberate reason; it silently broadens the trust boundary. `O_CLOEXEC` is unconditionally OR'd into the flags so the opened file descriptors do not leak into exec'd children (directory fds opened by `get_dir_handle` get the same treatment, plus `O_DIRECTORY | O_NONBLOCK`).
 
+`open_dir()` is the directory counterpart: it opens the entry as a new `DirHandle` through the same `openat2 + RESOLVE_BENEATH` path (with `O_DIRECTORY`), so recursive tree descent needs neither procfs nor path re-resolution and is immune to rename races by construction. Prefer it over `path()` + `DirHandle::new()` when walking trees.
+
+Beyond `len()`/`mode()`, the cached stat also feeds `is_empty()`, `uid()`, `gid()`, `nlink()`, and `mtime()`/`atime()`/`ctime()`. The timestamps come back as `TimeSinceEpoch` (`f64` seconds — about microsecond precision); callers needing exact nanosecond timespecs should read `stat()` directly.
+
 ## Equality, ordering, hashing
 
 `Eq`, `Ord` and `Hash` are all defined over explicit field tuples — **never** delegated to `nix::dir::Entry`'s derived impls. nix fills the dirent from `readdir_r` into a `MaybeUninit` buffer and only `d_reclen` bytes are copied, while the libc derives compare/hash the entire struct including `d_off`, `d_reclen` and the uninitialized tail of the 256-byte `d_name` array. Delegating would make the same logical entry compare unequal (and hash differently) between two reads within one process.

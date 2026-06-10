@@ -9,7 +9,7 @@ use nix::{
     dir::{Dir, Entry, Iter, Type},
     errno::Errno,
     fcntl::{openat2, AtFlags, OFlag, OpenHow, ResolveFlag},
-    sys::stat::{fstatat, Mode},
+    sys::stat::{fstat, fstatat, Mode},
 };
 use std::{
     cmp::{Eq, Ord, Ordering, PartialEq, PartialOrd},
@@ -22,7 +22,7 @@ use std::{
     iter::Peekable,
     marker::PhantomData,
     ops::{Deref, DerefMut},
-    os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, RawFd},
+    os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd, RawFd},
     os::unix::ffi::OsStrExt,
     path::{Path, PathBuf},
     rc::Rc,
@@ -41,6 +41,13 @@ const DOT1: &[u8] = b".";
 const DOT2: &[u8] = b"..";
 const LOOKAHEAD_BUFFER_SIZE: usize = 64;
 const PROC_FD_PATH: &str = "/proc/self/fd";
+/**
+Slack for the `state_changed_fast()` mtime pre-check: filesystem
+timestamp granularity (1s on older filesystems), f64 rounding and
+minor clock skew. Timestamps within this window of the baseline are
+treated as "maybe changed" and fall through to the full comparison.
+*/
+const MTIME_SLACK_SECS: f64 = 2.0;
 
 /**
 Since we cannot import [std::sys] directly (it's private), we need to
@@ -98,7 +105,7 @@ negative value indicates that the file descriptor used to be open.
 Due to internally using an [AtomicI32], it is thread-safe.
 
 Mapping:
-- `DirFd >= 0` : Open file descriptor. `fd == 0` is a valid (open) fd —
+- `DirFd >= 0` : Open file descriptor. `fd == 0` is a valid (open) fd -
   it's stdin's slot, but a process that closed stdin can legitimately
   receive it from `open()`.
 - `DirFd == i32::MIN` : Uninitialized (the default state).
@@ -135,7 +142,7 @@ impl DirFd {
 
     Atomic with respect to other `set` / `clear` calls: two concurrent
     `set`s cannot both succeed, and a concurrent `clear` either lands
-    before or after — never in between the check and the store.
+    before or after - never in between the check and the store.
     */
     pub fn set(&self, fd: RawFd) -> Result<RawFd, RawFd> {
         self.0
@@ -364,6 +371,50 @@ impl<'h> EntryExt<'h> {
         }
     }
 
+    /// Whether the entry is a zero-length file (or stat() failed; see `len()`).
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Owner uid of the entry, if it can be stat()ed.
+    pub fn uid(&self) -> Option<libc::uid_t> {
+        self.stat().map(|s: libc::stat| s.st_uid)
+    }
+
+    /// Owner gid of the entry, if it can be stat()ed.
+    pub fn gid(&self) -> Option<libc::gid_t> {
+        self.stat().map(|s: libc::stat| s.st_gid)
+    }
+
+    /// Number of hard links to the entry, if it can be stat()ed.
+    pub fn nlink(&self) -> Option<u64> {
+        self.stat().map(|s: libc::stat| s.st_nlink as u64)
+    }
+
+    /**
+    Last modification time of the entry, if it can be stat()ed.
+
+    NOTE: [TimeSinceEpoch] is `f64` seconds - roughly microsecond
+    precision in the current era. Use `stat()` directly if you need the
+    exact nanosecond timespec.
+    */
+    pub fn mtime(&self) -> Option<TimeSinceEpoch> {
+        self.stat().map(|s: libc::stat| stat_time(s.st_mtime, s.st_mtime_nsec))
+    }
+
+    /// Last access time of the entry, if it can be stat()ed. See `mtime()`
+    /// for the precision caveat.
+    pub fn atime(&self) -> Option<TimeSinceEpoch> {
+        self.stat().map(|s: libc::stat| stat_time(s.st_atime, s.st_atime_nsec))
+    }
+
+    /// Last status (inode) change time of the entry, if it can be stat()ed.
+    /// See `mtime()` for the precision caveat.
+    pub fn ctime(&self) -> Option<TimeSinceEpoch> {
+        self.stat().map(|s: libc::stat| stat_time(s.st_ctime, s.st_ctime_nsec))
+    }
+
     /// Open this entry as a [std::fs::File] with the given flags.
     /// `O_CLOEXEC` is always added so the fd does not leak across `exec`.
     fn open(&self, flags: OFlag) -> io::Result<File> {
@@ -382,6 +433,25 @@ impl<'h> EntryExt<'h> {
     /// Open this entry for read+write as a [std::fs::File] object.
     pub fn write(&self) -> io::Result<File> {
         self.open(OFlag::O_RDWR)
+    }
+
+    /**
+    Open this entry as a new [DirHandle], if it is a directory.
+
+    Like `open()`, this resolves via `openat2` with `RESOLVE_BENEATH`
+    (plus `O_DIRECTORY`, `O_CLOEXEC` and `O_NONBLOCK`), so descending
+    into a subdirectory needs neither procfs nor path re-resolution and
+    is immune to rename races by construction - the natural primitive
+    for recursive tree scans. Fails with `ENOTDIR` on non-directories.
+    */
+    pub fn open_dir(&self) -> io::Result<DirHandle> {
+        let flags: OFlag =
+            OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC | OFlag::O_NONBLOCK;
+        let open_how: OpenHow = OpenHow::new()
+            .flags(flags)
+            .resolve(ResolveFlag::RESOLVE_BENEATH);
+        let fd: OwnedFd = openat2(&self.dirfd, self.file_name(), open_how)?;
+        DirHandle::from_fd(fd)
     }
 
     #[inline]
@@ -464,7 +534,7 @@ NOTE: equality is defined over `(name, inode, parent dirfd)`. We must NOT
 delegate to `nix::dir::Entry`'s derived `PartialEq`: nix fills the dirent
 from `readdir_r` into a `MaybeUninit` buffer and only `d_reclen` bytes get
 copied, while libc's derived comparison reads the full 256-byte `d_name`
-array (plus `d_off`/`d_reclen`) — i.e. uninitialized garbage. The same
+array (plus `d_off`/`d_reclen`) - i.e. uninitialized garbage. The same
 logical entry read twice could compare unequal.
 */
 impl<'h> PartialEq for EntryExt<'h> {
@@ -479,7 +549,7 @@ impl<'h> Ord for EntryExt<'h> {
     /**
     Primarily by name (which is unique within a directory); inode and
     parent dirfd act as tie-breakers so the total order is consistent
-    with [PartialEq] — `cmp() == Equal` if and only if `eq()`.
+    with [PartialEq] - `cmp() == Equal` if and only if `eq()`.
     */
     #[inline]
     fn cmp(&self, other: &Self) -> Ordering {
@@ -508,7 +578,7 @@ impl<'h> Deref for EntryExt<'h> {
 
 impl<'h> Hash for EntryExt<'h> {
     /**
-    Hashes `(name, inode)` — a subset of the [PartialEq] fields, so the
+    Hashes `(name, inode)` - a subset of the [PartialEq] fields, so the
     `Hash`/`Eq` contract holds. The dirfd is deliberately omitted: hashing
     it would invalidate hashes whenever the directory is reopened under a
     different fd. We must not delegate to `Entry`'s derived `Hash` either,
@@ -740,6 +810,19 @@ impl DirHandle {
         })
     }
 
+    /**
+    Construct a [DirHandle] from an already-open directory file descriptor
+    (e.g. one returned by `openat` / `openat2`). Takes ownership: the fd
+    is closed when the handle drops. Fails with `ENOTDIR` if the fd does
+    not refer to a directory.
+    */
+    pub fn from_fd(fd: OwnedFd) -> io::Result<Self> {
+        Ok(Self {
+            inner: Dir::from_fd(fd)?,
+            state: DirectoryState::default(),
+        })
+    }
+
     /// Our file descriptor as a [DirFd] object.
     pub fn fd(&self) -> DirFd {
         self.inner.as_raw_fd().into()
@@ -761,7 +844,7 @@ impl DirHandle {
     /**
     Current state of the directory as a [DirectoryState] object.
 
-    Does **not** touch the stored state — use `state_changed()` for that.
+    Does **not** touch the stored state - use `state_changed()` for that.
     Returns an error if a `readdir` failure cuts the listing short, since
     a partial listing must not masquerade as the directory's state.
     */
@@ -785,6 +868,49 @@ impl DirHandle {
     }
 
     /**
+    Like `state_changed()`, but with a cheap timestamp pre-check.
+
+    A directory's own mtime changes exactly when its entry list changes
+    (add / remove / rename) - which is precisely what [DirectoryState]
+    tracks. If both mtime and ctime of the directory are clearly older
+    than the stored baseline, we report "unchanged" after a single
+    `fstat` syscall instead of re-listing and re-hashing every entry.
+    Timestamps within [MTIME_SLACK_SECS] of the baseline fall through
+    to the full `state_changed()` comparison.
+
+    NOTE: a backdated directory mtime (e.g. `touch -d` on the directory
+    itself) can defeat the pre-check; use `state_changed()` if that is
+    a concern.
+    */
+    pub fn state_changed_fast(&mut self) -> io::Result<bool> {
+        if let Some(when) = &self.state.when {
+            let st: libc::stat = self.stat()?;
+            let mtime: f64 = stat_time(st.st_mtime, st.st_mtime_nsec).get();
+            let ctime: f64 = stat_time(st.st_ctime, st.st_ctime_nsec).get();
+            if mtime.max(ctime) + MTIME_SLACK_SECS < when.get() {
+                return Ok(false);
+            }
+        }
+        self.state_changed()
+    }
+
+    /// `fstat()` the directory itself (not its entries).
+    pub fn stat(&self) -> io::Result<libc::stat> {
+        Ok(fstat(&self.inner)?)
+    }
+
+    /**
+    Modification time of the directory itself. A directory's mtime
+    changes when entries are added to, removed from or renamed within
+    it (not when file contents change). See `EntryExt::mtime()` for
+    the `f64` precision caveat.
+    */
+    pub fn mtime(&self) -> io::Result<TimeSinceEpoch> {
+        let st: libc::stat = self.stat()?;
+        Ok(stat_time(st.st_mtime, st.st_mtime_nsec))
+    }
+
+    /**
     Return the inner [nix::dir::Iter] object and make it `Peekable`.
 
     NOTE: this iterator will return the special `.` and `..` entries.
@@ -803,7 +929,7 @@ impl DirHandle {
 
     NOTE: the special `.` and `..` entries will be processed as well.
 
-    NOTE: iteration stops at the first `readdir` error — skipping errors
+    NOTE: iteration stops at the first `readdir` error - skipping errors
     would loop forever on a persistently failing stream (e.g. `ESTALE`).
     */
     pub fn for_each<F>(&mut self, mut f: F)
@@ -919,7 +1045,7 @@ impl AsRawFd for DirHandle {
 
 /*
 DirHandle is automatically Send (nix::dir::Dir is explicitly Send, the
-rest of the fields are plain data), so no `unsafe impl` is needed — and
+rest of the fields are plain data), so no `unsafe impl` is needed - and
 having one would silently mask a future non-Send field. This assertion
 keeps the requirement checked at compile time: [OpenHandles] shares
 handles across threads and needs `DirHandle: Send`.
@@ -956,8 +1082,8 @@ struct BufDeque<T> {
     /**
     Number of directory entries currently buffered. Lets `try_pop_dir`
     skip the linear scan in the (common) all-files case. The counter
-    stays in sync because `is_dir()` is stable per entry — `d_type` is
-    fixed and the stat fallback result is cached — and all mutation
+    stays in sync because `is_dir()` is stable per entry - `d_type` is
+    fixed and the stat fallback result is cached - and all mutation
     goes through `push` / `try_pop_dir` (no `DerefMut` escape hatch).
     */
     n_dirs: usize,
@@ -1107,9 +1233,11 @@ impl<'handle> DirHandleIter<'handle> {
     fn is_next_dir(&mut self) -> Option<bool> {
         self.inner.peek().map_or(Some(false), |res| {
             res.map_or(Some(false), |e: Entry| {
-                // `.` and `..` are both directories, but `get_one()` filters
-                // them out — treating them as "next dir" here would wrongly
-                // defer the current entry only to have the dot skipped.
+                /*
+                `.` and `..` are both directories, but `get_one()` filters
+                them out - treating them as "next dir" here would wrongly
+                defer the current entry only to have the dot skipped.
+                */
                 if matches!(e.file_name().to_bytes(), DOT1 | DOT2) {
                     return Some(false);
                 }
@@ -1123,9 +1251,11 @@ impl<'handle> DirHandleIter<'handle> {
     fn get_one(&mut self) -> Option<EntryExt<'handle>> {
         let entry: EntryExt<'handle> = next(&mut self.inner, self.dirfd, self.stat)?;
         if self.update {
-            // store the entry's stable digest for state hashing — 8 bytes
-            // per entry instead of cloning the whole EntryExt, which kept
-            // the full listing in memory until the pass completed
+            /*
+            store the entry's stable digest for state hashing - 8 bytes
+            per entry instead of cloning the whole EntryExt, which kept
+            the full listing in memory until the pass completed
+            */
             let digest: u64 = entry.xxh3_digest();
 
             #[cfg(debug_assertions)]
@@ -1385,11 +1515,11 @@ impl OpenHandles {
 
 /*
 SAFETY: DashMap<RawFd, DirHandle> is not auto-Sync because DirHandle is
-!Sync (nix::dir::Dir is deliberately !Sync — readdir on a shared DIR*
+!Sync (nix::dir::Dir is deliberately !Sync - readdir on a shared DIR*
 races). Sharing &OpenHandles is still sound because DashMap's per-shard
 RwLock makes &mut DirHandle access (checkout / for_each_mut) exclusive,
 and concurrent shared access (for_each / iter) only reaches `&self`
-methods of DirHandle — fd(), path(), state(), as_raw_fd(), Hash, Eq —
+methods of DirHandle - fd(), path(), state(), as_raw_fd(), Hash, Eq -
 none of which touch the underlying DIR* stream state.
 
 INVARIANT: keep it that way. Any future `&self` method on DirHandle
@@ -1444,7 +1574,7 @@ impl<'a> CheckedOutHandle<'a> {
     NOTE: the internal lock must be released before removing the entry
     (see the deadlock caveat on [OpenHandles]), which opens a tiny
     window where another thread may close this fd and the kernel may
-    recycle the number for a freshly opened handle — in that case the
+    recycle the number for a freshly opened handle - in that case the
     new entry gets evicted instead. Same fd-reuse caveat as documented
     on `OpenHandles::open`.
     */
@@ -1481,7 +1611,7 @@ impl Debug for CheckedOutHandle<'_> {
 Resolve an open file descriptor to its path via `/proc/self/fd/<fd>`.
 
 NOTE: `/proc/self/fd` is itself a directory (its *entries* are symlinks),
-so probing procfs availability must not `readlink()` the directory — that
+so probing procfs availability must not `readlink()` the directory - that
 fails with EINVAL even when procfs is mounted. We attempt the per-fd
 resolution directly and only diagnose a missing procfs after a failure.
 */
@@ -1493,6 +1623,15 @@ fn proc_fd_path(fd: RawFd) -> io::Result<PathBuf> {
             e
         }
     })
+}
+
+/**
+Convert a `(secs, nsecs)` timestamp pair from a [libc::stat] into a
+[TimeSinceEpoch]. Inherently lossy: `f64` seconds carry roughly
+microsecond precision in the current era, not nanoseconds.
+*/
+fn stat_time(secs: i64, nsecs: i64) -> TimeSinceEpoch {
+    TimeSinceEpoch::new_from(secs as f64 + nsecs as f64 * 1e-9)
 }
 
 /// Open a directory and return its handle.
@@ -1521,7 +1660,7 @@ digests makes the result independent of `readdir` order; the per-entry
 digests already cover `(name, inode, typenum)`, so the same set of
 entries always produces the same combined digest.
 
-This is the single source of truth for [DirectoryState] hashing — both
+This is the single source of truth for [DirectoryState] hashing - both
 the lazy in-iterator computation and `directory_state()` go through it,
 which keeps the two paths comparable.
 */
@@ -1570,14 +1709,14 @@ skipping `.` and `..`.
 
 Entries whose file type cannot be determined (`d_type` is `DT_UNKNOWN`
 and the `fstatat` fallback fails, e.g. due to permission denied) are
-yielded too — their `file_type()` returns `None` and the caller decides
+yielded too - their `file_type()` returns `None` and the caller decides
 what to do. Silently dropping them would make a listable-but-unsearchable
 directory iterate as empty on filesystems that don't populate `d_type`.
 
 A `readdir` error ends the iteration: a persistent error (e.g. `ESTALE`
 on NFS, `EIO`) would otherwise be skipped forever and spin this loop. The
 error is deliberately left **unconsumed** in the [Peekable] slot, so it is
-sticky — callers can observe it via `peek()` and repeated calls return
+sticky - callers can observe it via `peek()` and repeated calls return
 `None` without re-issuing failing `readdir` syscalls.
 
 If `stat == true`, we also `stat()` the entry before returning it.
@@ -1598,9 +1737,11 @@ fn next<'h>(
         }
         let entry: Entry = it.next()?.expect("peeked entry was Ok");
 
-        // Sadly it appears that we cannot rely on the special "." and ".."
-        // entries being returned first by the libc `readdir` call, so to
-        // filter them out we must match each name.
+        /*
+        Sadly it appears that we cannot rely on the special "." and ".."
+        entries being returned first by the libc `readdir` call, so to
+        filter them out we must match each name.
+        */
         if matches!(entry.file_name().to_bytes(), DOT1 | DOT2) {
             continue;
         }
