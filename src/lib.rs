@@ -878,9 +878,11 @@ impl DirHandle {
     Timestamps within [MTIME_SLACK_SECS] of the baseline fall through
     to the full `state_changed()` comparison.
 
-    NOTE: a backdated directory mtime (e.g. `touch -d` on the directory
-    itself) can defeat the pre-check; use `state_changed()` if that is
-    a concern.
+    NOTE: backdating the directory mtime (`touch -d` / `utimensat`) does
+    **not** defeat the pre-check, because those calls bump ctime, which
+    we also consider (verified in the integration tests). Only direct
+    clock manipulation or a filesystem with broken ctime semantics could
+    produce a false "unchanged" here.
     */
     pub fn state_changed_fast(&mut self) -> io::Result<bool> {
         if let Some(when) = &self.state.when {
@@ -1753,5 +1755,142 @@ fn next<'h>(
         };
         trace!(target: "name", "{:?} : {:?}", entry.name(), entry);
         return Some(entry);
+    }
+}
+
+/* ################################# TESTS ################################# */
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::hash_map::DefaultHasher;
+
+    fn siphash<T: Hash>(item: &T) -> u64 {
+        let mut hasher: DefaultHasher = DefaultHasher::new();
+        item.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    #[test]
+    fn dirfd_state_machine() {
+        let fd = DirFd::default();
+        assert!(!fd.is_open());
+        assert_eq!(fd.fd(), UNINIT_FD);
+        assert!(fd.path().is_err(), "uninit fd must not resolve");
+
+        assert_eq!(fd.set(5), Ok(5));
+        assert!(fd.is_open());
+        assert_eq!(fd.set(7), Err(5), "set() must refuse to overwrite an open fd");
+
+        fd.clear();
+        assert!(!fd.is_open());
+        assert_eq!(fd.fd(), !5, "stale encoding is bitwise NOT of the old fd");
+        assert!(fd.path().is_err(), "stale fd must not resolve");
+
+        fd.clear();
+        assert_eq!(fd.fd(), UNINIT_FD, "second clear() buries the stale fd");
+
+        // fd 0 is a valid open fd and its stale marker (-1) stays distinct
+        // from the uninitialized sentinel
+        let zero = DirFd::from(0);
+        assert!(zero.is_open());
+        zero.clear();
+        assert_eq!(zero.fd(), -1);
+        assert!(!zero.is_open());
+        assert_eq!(zero.set(3), Ok(3), "stale fd may be overwritten");
+    }
+
+    #[test]
+    fn dirfd_as_fd_panics_when_not_open() {
+        let fd = DirFd::default();
+        let res = std::panic::catch_unwind(|| {
+            let _ = fd.as_fd();
+        });
+        assert!(res.is_err(), "as_fd on a closed DirFd must panic, not be UB");
+    }
+
+    #[test]
+    #[rustfmt::skip]
+    fn entry_type_classification() {
+        assert!(EntryType(libc::S_IFDIR | 0o755).is_dir());
+        assert!(EntryType(libc::S_IFREG | 0o644).is_file());
+        assert!(EntryType(libc::S_IFLNK | 0o777).is_symlink());
+        assert_eq!(EntryType(libc::S_IFDIR).entry_t(),  Some(Type::Directory));
+        assert_eq!(EntryType(libc::S_IFREG).entry_t(),  Some(Type::File));
+        assert_eq!(EntryType(libc::S_IFLNK).entry_t(),  Some(Type::Symlink));
+        assert_eq!(EntryType(libc::S_IFIFO).entry_t(),  Some(Type::Fifo));
+        assert_eq!(EntryType(libc::S_IFSOCK).entry_t(), Some(Type::Socket));
+        assert_eq!(EntryType(libc::S_IFBLK).entry_t(),  Some(Type::BlockDevice));
+        assert_eq!(EntryType(libc::S_IFCHR).entry_t(),  Some(Type::CharacterDevice));
+        assert_eq!(EntryType(0).entry_t(), None, "DT_UNKNOWN-ish mode has no type");
+    }
+
+    #[test]
+    fn digest_of_digests_is_order_independent() {
+        let a: u64 = digest_of_digests(vec![1, 2, 3]);
+        let b: u64 = digest_of_digests(vec![3, 1, 2]);
+        assert_eq!(a, b, "same set must digest equal regardless of order");
+        assert_ne!(a, digest_of_digests(vec![1, 2]), "different sets must differ");
+        assert_eq!(digest_of_digests(vec![]), digest_of_digests(vec![]));
+        assert_ne!(digest_of_digests(vec![]), a);
+    }
+
+    #[test]
+    fn stat_time_conversion() {
+        let t: f64 = stat_time(1_700_000_000, 500_000_000).get();
+        assert!((t - 1_700_000_000.5).abs() < 1e-3, "got {t}");
+        assert_eq!(stat_time(0, 0).get(), 0.0);
+    }
+
+    #[test]
+    fn state_change_precedence_and_deltas() {
+        let base = DirectoryState {
+            dirs: 2,
+            files: 10,
+            hash_d: 0x1111,
+            hash_f: 0x2222,
+            when: None,
+        };
+        assert!(base.change(&base.clone()).is_same());
+
+        // count changes win over hash changes, deltas are signed i64
+        let mut more = base.clone();
+        more.dirs = 5;
+        more.hash_d = 0x9999;
+        match base.change(&more) {
+            StateChange::DirNum(d) => assert_eq!(d, 3),
+            c => panic!("expected DirNum(3), got {c:?}"),
+        }
+
+        let mut fewer = base.clone();
+        fewer.files = 4;
+        match base.change(&fewer) {
+            StateChange::FileNum(d) => assert_eq!(d, -6),
+            c => panic!("expected FileNum(-6), got {c:?}"),
+        }
+
+        // same counts, different hash
+        let mut hashed = base.clone();
+        hashed.hash_f = 0xdead;
+        assert!(matches!(base.change(&hashed), StateChange::FileHash));
+        let mut hashed_d = base.clone();
+        hashed_d.hash_d = 0xbeef;
+        assert!(matches!(base.change(&hashed_d), StateChange::DirHash));
+    }
+
+    #[test]
+    fn directory_state_eq_and_hash_ignore_when() {
+        let a = DirectoryState {
+            dirs: 1,
+            files: 2,
+            hash_d: 3,
+            hash_f: 4,
+            when: None,
+        };
+        let mut b = a.clone();
+        b.when = Some(TimeSinceEpoch::new());
+        assert_eq!(a, b, "Eq must ignore `when`");
+        assert_eq!(siphash(&a), siphash(&b), "Hash must agree with Eq");
+        assert_eq!(a.hash_all(), b.hash_all());
     }
 }

@@ -8,11 +8,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - Build with the optional accounting feature: `cargo build --features size_of`
 - Lint: `cargo clippy --all-targets` (add `--features size_of` to lint gated code too)
 - Format: `cargo fmt`
-- Tests: none currently exist in-tree. `cargo test` will compile the crate but run zero tests.
+- Tests: `cargo test` runs unit tests (in `src/lib.rs` under `#[cfg(test)]`, covering private internals: `DirFd` state machine, `digest_of_digests`, `StateChange` ordering) and integration tests (`tests/integration.rs`, covering the public API against real temp directories). Run them before committing changes to iteration, state tracking, or fd handling.
 
 ## Crate shape
 
-- Single-file library: all code lives in `src/lib.rs`. There is no `mod` tree and no examples/benches/tests directories — additions of public API go here.
+- Single-file library: all code lives in `src/lib.rs`. There is no `mod` tree and no examples/benches directories — additions of public API go here. Integration tests live in `tests/integration.rs`; the only dev-dependency is `libc` (integration tests are separate crates and cannot see the library's own deps).
 - `publish = false` in `Cargo.toml`; downstream projects consume this crate via git dependency, not crates.io.
 - Several dependencies (`custom_xxh3`, `timesince`, `miniutils`, `enhvec`, and a fork of `size-of`) are pulled from `github.com/Ukko-Ylijumala/*` git repos. The `size-of` fork specifically exists to work around a Rust ≥1.89 compiler error (E0570) in upstream — do not switch back to upstream `size-of` without verifying the fix is published.
 - Linux-only: depends on `nix` (`fs` + `dir` features), `libc::stat`/`mode_t`, and `/proc/self/fd` for fd→path resolution. Anything that breaks procfs availability breaks `DirFd::path()` and `DirHandle::path()` by design (they return `io::Error` rather than panicking).
