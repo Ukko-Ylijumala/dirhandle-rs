@@ -21,6 +21,10 @@ There is also `entries(dirs, files)` / `entries_sorted()` for non-iterator acces
 
 The result is a **heuristic preference**, not a guarantee. Some filesystems never populate `d_type`, so the iterator may have to materialise the next entry to decide ordering. Calling code must not rely on strict dir-before-file ordering — for that, use `iter_sorted()`.
 
+## Error semantics
+
+A `readdir` error terminates the pass. Errors must **not** be skipped-and-continued: a persistently failing stream (`ESTALE` on NFS, `EIO` on a dying disk) would otherwise spin the skip loop forever, one failing syscall per iteration. The free `next()` helper leaves the error **unconsumed** in the `Peekable` slot, making it sticky: `done()` treats a peeked `Err` as end-of-stream, and repeated calls return `None` from the cached peek without re-issuing syscalls. An error-terminated pass yields an incomplete listing, so `DirHandleIter` skips `DirectoryState` finalisation in that case (`when` stays `None`, a later clean pass computes it). `for_each` uses `map_while(Result::ok)` for the same stop-on-first-error behaviour.
+
 ## Rewind semantics
 
 When the inner iterator is exhausted, `DirHandleIter::next` returns `None` after (a) optionally finalising `DirectoryState` (see [state-tracking.md](state-tracking.md)) and (b) leaving the inner `Dir` rewound for the next iteration.

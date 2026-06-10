@@ -15,6 +15,7 @@ use nix::{
 use std::{
     cmp::{Eq, Ord, Ordering, PartialEq, PartialOrd},
     collections::VecDeque,
+    ffi::OsStr,
     fmt::{self, Debug, Display, Formatter},
     fs::{read_link, File, OpenOptions},
     hash::{Hash, Hasher},
@@ -23,6 +24,7 @@ use std::{
     marker::PhantomData,
     ops::{Deref, DerefMut},
     os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, RawFd},
+    os::unix::ffi::OsStrExt,
     path::{Path, PathBuf},
     rc::Rc,
     sync::{
@@ -185,9 +187,6 @@ impl DirFd {
     - file descriptor not found in procfs
     */
     pub fn path(&self) -> io::Result<PathBuf> {
-        if read_link(PROC_FD_PATH).is_err() {
-            return Err(io::Error::new(io::ErrorKind::Unsupported, "procfs not available"));
-        }
         let fd: RawFd = self.fd();
         if fd == UNINIT_FD {
             return Err(io::Error::new(io::ErrorKind::NotFound, "no file descriptor"));
@@ -195,7 +194,7 @@ impl DirFd {
         if fd < 0 {
             return Err(io::Error::new(io::ErrorKind::NotFound, "stale file descriptor"));
         }
-        read_link(format!("{}/{}", PROC_FD_PATH, fd))
+        proc_fd_path(fd)
     }
 }
 
@@ -378,9 +377,10 @@ impl<'h> EntryExt<'h> {
     }
 
     /// Open this entry as a [std::fs::File] with the given flags.
+    /// `O_CLOEXEC` is always added so the fd does not leak across `exec`.
     fn open(&self, flags: OFlag) -> io::Result<File> {
         let open_how: OpenHow = OpenHow::new()
-            .flags(flags)
+            .flags(flags | OFlag::O_CLOEXEC)
             .resolve(ResolveFlag::RESOLVE_BENEATH);
         let fd = openat2(&self.dirfd, self.file_name(), open_how)?;
         Ok(unsafe { File::from_raw_fd(fd.into_raw_fd()) })
@@ -410,13 +410,13 @@ impl<'h> EntryExt<'h> {
     /**
     This relies on proc filesystem being available due to the use of
     `/proc/self/fd` to resolve the parent directory by file descriptor.
+
+    The entry name is joined as raw bytes ([OsStr]), so non-UTF-8 file
+    names resolve to their real paths instead of a lossy approximation.
     */
     pub fn path(&self) -> io::Result<PathBuf> {
-        if read_link(PROC_FD_PATH).is_err() {
-            return Err(io::Error::new(io::ErrorKind::Unsupported, "procfs not available"));
-        }
-        let link = read_link(format!("{}/{}", PROC_FD_PATH, self.dirfd.as_raw_fd()))?;
-        Ok(link.join(self.name()))
+        let link: PathBuf = proc_fd_path(self.dirfd.as_raw_fd())?;
+        Ok(link.join(OsStr::from_bytes(self.name_as_bytes())))
     }
 
     /// Return the file type of the entry as a [nix::dir::Type] enum.
@@ -565,7 +565,7 @@ impl StateChange {
 /* --------------------------------- */
 
 /// This struct holds the state of a directory for change detection.
-#[derive(Clone, Hash)]
+#[derive(Clone)]
 pub struct DirectoryState {
     dirs: usize,
     files: usize,
@@ -634,6 +634,18 @@ impl PartialEq for DirectoryState {
             && self.files == other.files
             && self.hash_d == other.hash_d
             && self.hash_f == other.hash_f
+    }
+}
+
+impl Hash for DirectoryState {
+    /// `when` is excluded to uphold the `Hash`/`Eq` contract: [PartialEq]
+    /// above compares only the content fields, so equal states must produce
+    /// equal hashes regardless of when their snapshots were taken.
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.dirs.hash(state);
+        self.files.hash(state);
+        self.hash_d.hash(state);
+        self.hash_f.hash(state);
     }
 }
 
@@ -763,6 +775,9 @@ impl DirHandle {
     safe access to the inner [nix::dir::Iter] iterator.
 
     NOTE: the special `.` and `..` entries will be processed as well.
+
+    NOTE: iteration stops at the first `readdir` error — skipping errors
+    would loop forever on a persistently failing stream (e.g. `ESTALE`).
     */
     pub fn for_each<F>(&mut self, mut f: F)
     where
@@ -770,7 +785,7 @@ impl DirHandle {
     {
         self.inner
             .iter()
-            .filter_map(Result::ok)
+            .map_while(Result::ok)
             .for_each(|entry: Entry| {
                 f(&entry);
             });
@@ -1001,10 +1016,17 @@ impl<'handle> DirHandleIter<'handle> {
         self.xxh.is_some()
     }
 
-    /// Is the inner iterator done?
+    /// Is the inner iterator done? A sticky `readdir` error (see [next])
+    /// also ends the iteration.
     #[inline]
     fn done(&mut self) -> bool {
-        self.inner.peek().is_none()
+        matches!(self.inner.peek(), None | Some(Err(_)))
+    }
+
+    /// Did the inner iterator stop early due to a `readdir` error?
+    #[inline]
+    fn errored(&mut self) -> bool {
+        matches!(self.inner.peek(), Some(Err(_)))
     }
 
     /**
@@ -1121,6 +1143,15 @@ impl<'handle> Iterator for DirHandleIter<'handle> {
                 }
             } else if self.done() {
                 debug!(target: "DirHandleIter::next", "iter_done: {:?}", self.inner);
+                if self.errored() {
+                    // the listing is incomplete, so we must not finalize the
+                    // DirectoryState from partial data; `when` stays as-is and
+                    // a later full pass will compute the state instead.
+                    warn!(target: "DirHandleIter::next",
+                        "readdir error ended iteration early, state not updated: {:?}",
+                        self.inner.peek());
+                    return None;
+                }
                 if self.update() {
                     // hash the sorted entries and set DirHandle state
                     let mut xxh: CustomXxh3Hasher = self.xxh.take().unwrap();
@@ -1369,9 +1400,34 @@ impl Debug for CheckedOutHandle<'_> {
 
 /* ########################### UTILITY FUNCTIONS ########################### */
 
+/**
+Resolve an open file descriptor to its path via `/proc/self/fd/<fd>`.
+
+NOTE: `/proc/self/fd` is itself a directory (its *entries* are symlinks),
+so probing procfs availability must not `readlink()` the directory — that
+fails with EINVAL even when procfs is mounted. We attempt the per-fd
+resolution directly and only diagnose a missing procfs after a failure.
+*/
+fn proc_fd_path(fd: RawFd) -> io::Result<PathBuf> {
+    read_link(format!("{}/{}", PROC_FD_PATH, fd)).map_err(|e| {
+        if e.kind() == io::ErrorKind::NotFound && !Path::new(PROC_FD_PATH).is_dir() {
+            io::Error::new(io::ErrorKind::Unsupported, "procfs not available")
+        } else {
+            e
+        }
+    })
+}
+
 /// Open a directory and return its handle.
 fn get_dir_handle(path: &Path) -> io::Result<Dir> {
-    Ok(Dir::open(path, OFlag::O_RDONLY, Mode::empty())?)
+    // - O_DIRECTORY: fail with ENOTDIR up front instead of e.g. blocking
+    //   forever on a FIFO before `fdopendir` gets a chance to reject it.
+    // - O_CLOEXEC: don't leak directory fds to exec'd children.
+    // - O_NONBLOCK: belt-and-suspenders against blocking opens (matches
+    //   what std::fs::ReadDir passes to open(2)).
+    let flags: OFlag =
+        OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC | OFlag::O_NONBLOCK;
+    Ok(Dir::open(path, flags, Mode::empty())?)
 }
 
 /// Open a file and return its handle.
@@ -1397,6 +1453,12 @@ Return the next entry from the inner [nix::dir::Iter] as an [EntryExt],
 skipping `.` and `..`. Also skips entries where the file type cannot be
 determined (e.g. due to permission denied).
 
+A `readdir` error ends the iteration: a persistent error (e.g. `ESTALE`
+on NFS, `EIO`) would otherwise be skipped forever and spin this loop. The
+error is deliberately left **unconsumed** in the [Peekable] slot, so it is
+sticky — callers can observe it via `peek()` and repeated calls return
+`None` without re-issuing failing `readdir` syscalls.
+
 If `stat == true`, we also `stat()` the entry before returning it.
 */
 #[instrument(level = "trace", skip(it))]
@@ -1405,29 +1467,34 @@ fn next<'h>(
     dirfd: BorrowedFd<'h>,
     stat: bool,
 ) -> Option<EntryExt<'h>> {
-    it.filter_map(Result::ok)
-        .filter_map(|entry| {
-            // Sadly it appears that we cannot rely on the special "." and ".."
-            // entries being returned first by the libc `readdir` call, so to
-            // filter them out we must match each name.
-            if matches!(entry.file_name().to_bytes(), DOT1 | DOT2) {
+    loop {
+        match it.peek()? {
+            Ok(_) => {}
+            Err(e) => {
+                trace!(target: "readdir_err", "readdir failed, ending iteration: {e}");
                 return None;
             }
+        }
+        let entry: Entry = it.next()?.expect("peeked entry was Ok");
 
-            // convert the [nix::dir::Entry] to our `EntryExt`
-            let entry: EntryExt<'h> = match stat {
-                false => EntryExt::new(entry, dirfd),
-                true => EntryExt::new_statted(entry, dirfd),
-            };
-            if let Some(_) = entry.file_type() {
-                trace!(target: "name", "{:?} : {:?}", entry.name(), entry);
-                Some(entry)
-            } else {
-                // we ignore the entry if we can't determine its type
-                // (e.g. permission denied, unknown type)
-                trace!(target: "name", "{:?} : {:?} (skipping, no type)", entry.name(), entry);
-                return None;
-            }
-        })
-        .next()
+        // Sadly it appears that we cannot rely on the special "." and ".."
+        // entries being returned first by the libc `readdir` call, so to
+        // filter them out we must match each name.
+        if matches!(entry.file_name().to_bytes(), DOT1 | DOT2) {
+            continue;
+        }
+
+        // convert the [nix::dir::Entry] to our `EntryExt`
+        let entry: EntryExt<'h> = match stat {
+            false => EntryExt::new(entry, dirfd),
+            true => EntryExt::new_statted(entry, dirfd),
+        };
+        if entry.file_type().is_some() {
+            trace!(target: "name", "{:?} : {:?}", entry.name(), entry);
+            return Some(entry);
+        }
+        // we ignore the entry if we can't determine its type
+        // (e.g. permission denied, unknown type)
+        trace!(target: "name", "{:?} : {:?} (skipping, no type)", entry.name(), entry);
+    }
 }

@@ -27,7 +27,7 @@ Because the `BorrowedFd<'h>` guarantees the parent fd is alive for the entry's l
 
 ## Safe `openat2`
 
-`read()` and `write()` open the entry via `nix::fcntl::openat2` with `ResolveFlag::RESOLVE_BENEATH`. The kernel rejects any path that would resolve outside the parent dirfd — symlink loops, `..` traversals, or absolute paths. Do not "simplify" this to plain `openat` or `open` without a deliberate reason; it silently broadens the trust boundary.
+`read()` and `write()` open the entry via `nix::fcntl::openat2` with `ResolveFlag::RESOLVE_BENEATH`. The kernel rejects any path that would resolve outside the parent dirfd — symlink loops, `..` traversals, or absolute paths. Do not "simplify" this to plain `openat` or `open` without a deliberate reason; it silently broadens the trust boundary. `O_CLOEXEC` is unconditionally OR'd into the flags so the opened file descriptors do not leak into exec'd children (directory fds opened by `get_dir_handle` get the same treatment, plus `O_DIRECTORY | O_NONBLOCK`).
 
 ## Hashing
 
