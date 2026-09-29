@@ -41,10 +41,12 @@ const DOT2: &[u8] = b"..";
 const LOOKAHEAD_BUFFER_SIZE: usize = 64;
 const PROC_FD_PATH: &str = "/proc/self/fd";
 /**
-Slack for the `state_changed_fast()` mtime pre-check: filesystem
-timestamp granularity (1s on older filesystems), f64 rounding and
-minor clock skew. Timestamps within this window of the baseline are
-treated as "maybe changed" and fall through to the full comparison.
+Settling window for the `state_changed_fast()` pre-check. A baseline
+whose directory timestamps ([DirStamp]) lie within this window of the
+pass start is "racy": a change in the same timestamp granule would not
+have moved them, so the pre-check does not trust an unchanged stamp and
+runs the full comparison. Covers filesystem timestamp granularity (1 s
+on older filesystems, 2 s on FAT), f64 rounding and minor clock skew.
 */
 const MTIME_SLACK_SECS: f64 = 2.0;
 /*
@@ -791,6 +793,49 @@ impl StateChange {
 
 /* --------------------------------- */
 
+/**
+The directory's own mtime and ctime as `fstat` reported them just before
+a snapshot pass, exact to the nanosecond (no `f64` rounding). Both come
+from the filesystem's clock - the server's, on NFS / SMB / FUSE - so
+comparing two stamps is immune to skew between that clock and ours, and
+to a stale client attribute cache, unlike comparing a stamp with the
+local wall clock.
+*/
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DirStamp {
+    mtime: (i64, i64),
+    ctime: (i64, i64),
+}
+
+impl DirStamp {
+    /// Stamp an open directory; `None` if it cannot be `fstat`ed.
+    fn of<Fd: AsFd>(fd: Fd) -> Option<Self> {
+        fstat(fd).ok().map(|st: libc::stat| Self::from(&st))
+    }
+
+    /**
+    Whether this stamp is clearly older than `when`, the wall-clock start
+    of the pass it was taken for. Only then does an unchanged stamp prove
+    an unchanged directory: a change within the stamp's own timestamp
+    granule would not have moved it (see [MTIME_SLACK_SECS]).
+    */
+    fn settled_before(&self, when: &TimeSinceEpoch) -> bool {
+        let (secs, nsecs) = self.mtime.max(self.ctime);
+        stat_time(secs, nsecs).get() + MTIME_SLACK_SECS < when.get()
+    }
+}
+
+impl From<&libc::stat> for DirStamp {
+    fn from(st: &libc::stat) -> Self {
+        Self {
+            mtime: (st.st_mtime, st.st_mtime_nsec),
+            ctime: (st.st_ctime, st.st_ctime_nsec),
+        }
+    }
+}
+
+/* --------------------------------- */
+
 /// This struct holds the state of a directory for change detection.
 #[derive(Clone, Default)]
 pub struct DirectoryState {
@@ -799,13 +844,45 @@ pub struct DirectoryState {
     hash_d: u64,
     hash_f: u64,
     when: Option<TimeSinceEpoch>,
+    /// the directory's own timestamps at the start of the pass
+    stamp: Option<DirStamp>,
 }
 
 impl DirectoryState {
-    /// Update the state object with new values if they differ.
+    /**
+    Build the state of one complete pass from its digest folds. `when`
+    and `stamp` were both taken before the pass's first `readdir`. The
+    single constructor keeps the lazy in-iterator path and
+    `directory_state()` from drifting apart.
+    */
+    fn from_pass(
+        dirs: &DigestFold,
+        files: &DigestFold,
+        when: TimeSinceEpoch,
+        stamp: Option<DirStamp>,
+    ) -> Self {
+        Self {
+            dirs: dirs.len(),
+            files: files.len(),
+            hash_d: dirs.finish(),
+            hash_f: files.finish(),
+            when: Some(when),
+            stamp,
+        }
+    }
+
+    /**
+    Update the state object with new values if they differ. The
+    snapshot metadata (`when`, `stamp`) always moves on: a stamp left
+    behind would never match the directory again and would silently
+    disable the `state_changed_fast()` pre-check.
+    */
     fn update(&mut self, state: DirectoryState) {
         match self == &state {
-            true => self.when = state.when,
+            true => {
+                self.when = state.when;
+                self.stamp = state.stamp;
+            }
             false => *self = state,
         }
     }
@@ -854,9 +931,9 @@ impl PartialEq for DirectoryState {
 
 impl Hash for DirectoryState {
     /**
-    `when` is excluded to uphold the `Hash`/`Eq` contract: [PartialEq]
-    above compares only the content fields, so equal states must produce
-    equal hashes regardless of when their snapshots were taken.
+    `when` and `stamp` are excluded to uphold the `Hash`/`Eq` contract:
+    [PartialEq] above compares only the content fields, so equal states
+    must produce equal hashes regardless of when their snapshots were taken.
     */
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.dirs.hash(state);
@@ -1033,32 +1110,34 @@ impl DirHandle {
 
     A directory's own mtime changes exactly when its entry list changes
     (add / remove / rename) - which is precisely what [DirectoryState]
-    tracks. If both mtime and ctime of the directory are clearly older
-    than the stored baseline, we report "unchanged" after a single
-    `fstat` syscall instead of re-listing and re-hashing every entry.
-    Timestamps within [MTIME_SLACK_SECS] of the baseline fall through
-    to the full `state_changed()` comparison.
+    tracks. Every snapshot pass records the directory's mtime and ctime
+    ([DirStamp]) before its first `readdir`. If a single `fstat` now
+    returns exactly that stamp, and the stamp was already settled (older
+    than the pass start by more than [MTIME_SLACK_SECS]), we report
+    "unchanged" without re-listing and re-hashing every entry. Anything
+    else - a moved timestamp, a racy or missing stamp - falls through to
+    the full `state_changed()` comparison.
 
-    The baseline `when` is the time the snapshot pass **started**, not
-    when it finished: a change landing mid-pass may or may not have been
-    seen by `readdir`, so it must compare as "not older" here and force
-    the full check. Stamping the end of a pass longer than the slack
-    would let such a change slip through - and since this pre-check never
-    touches the stored state, it would keep slipping through on every
-    later call until something else bumped the directory mtime.
+    The stamp is compared with a stamp, never with our wall clock: on
+    NFS / SMB / FUSE both come from the server, so clock skew between the
+    server and us, or a listing served from a stale attribute cache,
+    cannot make a changed directory look "clearly older than the baseline"
+    (which the previous wall-clock comparison could, permanently, since
+    the pre-check never touches the stored state).
+
+    Taking the stamp at the **start** of the pass matters too: a change
+    landing mid-pass may or may not have been seen by `readdir`, but it
+    does move the timestamps past the stamp and so forces the full check.
 
     NOTE: backdating the directory mtime (`touch -d` / `utimensat`) does
-    **not** defeat the pre-check, because those calls bump ctime, which
-    we also consider (verified in the integration tests). Only direct
-    clock manipulation or a filesystem with broken ctime semantics could
-    produce a false "unchanged" here.
+    **not** defeat the pre-check: any timestamp difference forces the full
+    comparison, and those calls bump ctime as well (verified in the
+    integration tests).
     */
     pub fn state_changed_fast(&mut self) -> io::Result<bool> {
-        if let Some(when) = &self.state.when {
-            let st: libc::stat = self.stat()?;
-            let mtime: f64 = stat_time(st.st_mtime, st.st_mtime_nsec).get();
-            let ctime: f64 = stat_time(st.st_ctime, st.st_ctime_nsec).get();
-            if mtime.max(ctime) + MTIME_SLACK_SECS < when.get() {
+        if let (Some(when), Some(stamp)) = (&self.state.when, &self.state.stamp) {
+            let now: DirStamp = DirStamp::from(&self.stat()?);
+            if now == *stamp && stamp.settled_before(when) {
                 return Ok(false);
             }
         }
@@ -1355,6 +1434,9 @@ pub struct DirHandleIter<'handle> {
     for why the start, and not the end, of the pass is the right stamp.
     */
     started: TimeSinceEpoch,
+    /// the directory's own timestamps, taken just before `started` when
+    /// this pass is to finalize the [DirectoryState]
+    stamp: Option<DirStamp>,
 }
 
 impl<'handle> DirHandleIter<'handle> {
@@ -1378,6 +1460,8 @@ impl<'handle> DirHandleIter<'handle> {
         keeps the Dir alive.
         */
         let dirfd: BorrowedFd<'handle> = unsafe { BorrowedFd::borrow_raw(raw_fd) };
+        // only a finalizing pass needs the stamp (one fstat)
+        let stamp: Option<DirStamp> = if update { DirStamp::of(&handle.inner) } else { None };
         Self {
             dirfd,
             inner: handle.inner.iter().peekable(),
@@ -1389,6 +1473,7 @@ impl<'handle> DirHandleIter<'handle> {
             dirs: DigestFold::default(),
             files: DigestFold::default(),
             started: TimeSinceEpoch::new(),
+            stamp,
         }
     }
 
@@ -1466,11 +1551,8 @@ impl<'handle> DirHandleIter<'handle> {
         }
         if self.update {
             self.update = false;
-            self.state.dirs = self.dirs.len();
-            self.state.files = self.files.len();
-            self.state.hash_d = self.dirs.finish();
-            self.state.hash_f = self.files.finish();
-            self.state.when = self.started.clone().into();
+            *self.state =
+                DirectoryState::from_pass(&self.dirs, &self.files, self.started.clone(), self.stamp);
             trace!(target: "DirHandle.state", "{:?}", self.state);
         }
     }
@@ -1990,7 +2072,8 @@ listing early, in which case we return the error instead of a partial
 */
 #[instrument(level = "trace", skip_all, ret)]
 fn directory_state(dir: &mut DirHandle) -> io::Result<DirectoryState> {
-    // stamped before the first readdir - see `state_changed_fast()`
+    // both stamped before the first readdir - see `state_changed_fast()`
+    let stamp: Option<DirStamp> = DirStamp::of(&dir.inner);
     let started: TimeSinceEpoch = TimeSinceEpoch::new();
     let mut d_fold: DigestFold = DigestFold::default();
     let mut f_fold: DigestFold = DigestFold::default();
@@ -2004,13 +2087,7 @@ fn directory_state(dir: &mut DirHandle) -> io::Result<DirectoryState> {
     if let Some(errno) = iter.error() {
         return Err(io::Error::from_raw_os_error(errno as i32));
     }
-    Ok(DirectoryState {
-        dirs: d_fold.len(),
-        files: f_fold.len(),
-        hash_d: d_fold.finish(),
-        hash_f: f_fold.finish(),
-        when: started.into(),
-    })
+    Ok(DirectoryState::from_pass(&d_fold, &f_fold, started, stamp))
 }
 
 /**
@@ -2230,28 +2307,54 @@ mod tests {
     }
 
     #[test]
-    fn state_changed_fast_short_circuits_on_old_mtime() {
+    fn state_changed_fast_trusts_only_an_unchanged_settled_stamp() {
         let dir: PathBuf = std::env::temp_dir()
             .join(format!("dirhandle-unit-{}-fast-path", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("f1"), b"1").unwrap();
 
+        /*
+        Backdate the directory mtime first, so the change further down moves
+        it deterministically - on any timestamp granularity.
+        */
         let mut h = DirHandle::new(&dir).unwrap();
+        let past = libc::timespec { tv_sec: 1_000_000, tv_nsec: 0 };
+        let times: [libc::timespec; 2] = [past, past];
+        assert_eq!(unsafe { libc::futimens(h.as_raw_fd(), times.as_ptr()) }, 0);
         assert!(!h.state_changed_fast().unwrap(), "baseline");
+        assert!(h.state.stamp.is_some(), "the baseline pass must record a stamp");
 
-        // a modification that is real, but whose dir mtime/ctime are
-        // "clearly older" than the (forged) baseline, must be answered by
-        // the fstat pre-check alone - i.e. the early-return branch
-        std::fs::write(dir.join("f2"), b"2").unwrap();
-        let far_future: f64 = TimeSinceEpoch::new().get() + 1e6;
-        h.state.when = Some(TimeSinceEpoch::new_from(far_future));
+        /*
+        Settled baseline, untouched directory: answered by the fstat alone.
+        The stored count is forged, so a full comparison would report a
+        change - only the early return yields `false` here.
+        */
+        let far_future = TimeSinceEpoch::new_from(TimeSinceEpoch::new().get() + 1e6);
+        h.state.when = Some(far_future.clone());
+        h.state.files = 99;
         assert!(!h.state_changed_fast().unwrap(), "pre-check must short-circuit");
-        assert_eq!(h.state.files, 1, "short-circuit must not touch the stored state");
+        assert_eq!(h.state.files, 99, "short-circuit must not touch the stored state");
 
-        // and with an honest baseline the full path sees the change
-        h.state.when = Some(TimeSinceEpoch::new_from(0.0));
-        assert!(h.state_changed_fast().unwrap(), "full comparison must run");
+        /*
+        A real change moves the directory's timestamps, which forces the full
+        comparison although they are still "clearly older" than the baseline
+        - what a filesystem clock lagging ours looks like (NFS server skew,
+        stale attribute cache). The old wall-clock check answered `false`.
+        */
+        h.state.files = 1;
+        std::fs::write(dir.join("f2"), b"2").unwrap();
+        h.state.when = Some(far_future);
+        assert!(h.state_changed_fast().unwrap(), "moved stamp must force the full check");
+        assert_eq!(h.state.files, 2);
+
+        /*
+        That fresh baseline is racy (the directory changed just before the
+        pass): a change in the same timestamp granule would leave the stamp
+        as-is, so an unchanged stamp must not be trusted yet.
+        */
+        h.state.files = 99;
+        assert!(h.state_changed_fast().unwrap(), "racy stamp must force the full check");
         assert_eq!(h.state.files, 2);
 
         drop(h);
@@ -2306,6 +2409,7 @@ mod tests {
             hash_d: 0x1111,
             hash_f: 0x2222,
             when: None,
+            stamp: None,
         };
         assert!(base.change(&base.clone()).is_same());
 
@@ -2335,17 +2439,19 @@ mod tests {
     }
 
     #[test]
-    fn directory_state_eq_and_hash_ignore_when() {
+    fn directory_state_eq_and_hash_ignore_snapshot_metadata() {
         let a = DirectoryState {
             dirs: 1,
             files: 2,
             hash_d: 3,
             hash_f: 4,
             when: None,
+            stamp: None,
         };
         let mut b = a.clone();
         b.when = Some(TimeSinceEpoch::new());
-        assert_eq!(a, b, "Eq must ignore `when`");
+        b.stamp = Some(DirStamp { mtime: (1, 2), ctime: (3, 4) });
+        assert_eq!(a, b, "Eq must ignore `when` and `stamp`");
         assert_eq!(siphash(&a), siphash(&b), "Hash must agree with Eq");
         assert_eq!(a.hash_all(), b.hash_all());
     }

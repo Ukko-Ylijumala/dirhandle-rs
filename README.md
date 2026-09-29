@@ -86,7 +86,7 @@ if handle.state_changed()? {
 }
 ```
 
-`state_changed()` re-scans the directory (`state_changed_fast()` first checks the directory's own mtime/ctime and skips the re-scan when they are clearly older than the baseline); neither subscribes to inotify or similar. See [`doc/design/state-tracking.md`](doc/design/state-tracking.md) for the change-detection model and its lazy-population semantics.
+`state_changed()` re-scans the directory (`state_changed_fast()` first `fstat`s the directory and skips the re-scan when its mtime/ctime are exactly those recorded by the baseline pass, and were already settled back then); neither subscribes to inotify or similar. See [`doc/design/state-tracking.md`](doc/design/state-tracking.md) for the change-detection model and its lazy-population semantics.
 
 ### Manage many handles concurrently
 
@@ -138,4 +138,5 @@ Contributions are welcome, but please note that the API is still in flux. Openin
 - `0.4.3` — fixes: `DirectoryState.when` stamped at pass start (mid-pass changes could otherwise evade `state_changed_fast()` permanently), atomic insert+checkout in `OpenHandles::open`, `size_of` accounting. Perf: plain iteration mode for `entries()`/`iter_sorted()`, O(1) lookahead pop, allocation-free `CheckedOutHandle`.
 - `0.5.0` — **breaking**: compact `EntryExt` (≤ 80 bytes, no `Deref<Target = Entry>`; `file_name()`/`ino()`/`d_type()` are inherent, `new()` takes `&Entry`). **Digest scheme change**: commutative fold instead of sort-then-hash, `typenum()` yields kernel `DT_*` values.
 - `0.5.1` — README refresh, `d_type` fallback test, clippy sweep, `EntryExt::open()` without `unsafe`.
-- `0.5.2` — current. `DirHandle::path()` / `DirFd::path()` / `EntryExt::path()` fail with `NotFound` once the directory has been deleted, instead of returning procfs's `"<path> (deleted)"` string.
+- `0.5.2` — `DirHandle::path()` / `DirFd::path()` / `EntryExt::path()` fail with `NotFound` once the directory has been deleted, instead of returning procfs's `"<path> (deleted)"` string.
+- `0.5.3` — current. Fixes: `state_changed_fast()` compares the directory's timestamps with those recorded by the baseline pass instead of with the local clock, so server clock skew or a stale NFS attribute cache can no longer hide a change; `DirHandle::from_fd()` closes the fds it rejects instead of leaking them; `size_of` charges each handle its actual glibc stream buffer (`st_blksize`, 32 KiB .. 1 MiB) instead of a fixed 32 KiB.
