@@ -227,6 +227,43 @@ fn iteration_basics() {
 }
 
 #[test]
+fn untracked_iteration() {
+    let td = TestDir::new("untracked");
+    td.file("b.txt", b"b");
+    td.file("a.txt", b"a");
+    td.subdir("zdir");
+    td.subdir("adir");
+
+    let mut h = DirHandle::new(td.path()).unwrap();
+
+    // straight readdir order: exactly the raw stream minus `.` and `..`
+    let mut raw: Vec<Vec<u8>> = Vec::new();
+    h.for_each(|e| raw.push(e.file_name().to_bytes().to_vec()));
+    raw.retain(|n| n.as_slice() != b"." && n.as_slice() != b"..");
+    let untracked: Vec<Vec<u8>> = h.iter_untracked().map(|e| e.name_as_bytes().to_vec()).collect();
+    assert_eq!(untracked, raw, "iter_untracked must yield readdir order");
+
+    // the same entries as the tracked iterator, which may reorder them
+    let mut tracked: Vec<Vec<u8>> = h.iter().map(|e| e.name_as_bytes().to_vec()).collect();
+    let mut sorted: Vec<Vec<u8>> = untracked.clone();
+    tracked.sort();
+    sorted.sort();
+    assert_eq!(sorted, tracked);
+
+    // no state is computed, and an established one is left alone
+    let mut fresh = DirHandle::new(td.path()).unwrap();
+    assert_eq!(fresh.iter_untracked().count(), 4);
+    assert_eq!(fresh.state(), &DirectoryState::default(), "untracked pass must not finalize");
+    assert_eq!(fresh.iter().count(), 4);
+    let established: DirectoryState = fresh.state().clone();
+    assert_ne!(established, DirectoryState::default(), "tracked pass must still finalize");
+    td.file("c.txt", b"c");
+    assert_eq!(fresh.iter_untracked().count(), 5, "rewound and re-read");
+    assert_eq!(fresh.state(), &established, "untracked pass must not touch the state");
+    assert!(fresh.state_changed().unwrap(), "the tracked baseline still sees the change");
+}
+
+#[test]
 fn readdir_error_ends_pass_without_finalizing() {
     /*
     Regression: nix 0.30 drove readdir_r(3), which reports errors through
@@ -249,6 +286,12 @@ fn readdir_error_ends_pass_without_finalizing() {
     assert_eq!(it.error().map(|e| e as i32), Some(libc::ENOTDIR), "error must surface");
     drop(it);
     assert_eq!(h.state(), &DirectoryState::default(), "a failed pass must not finalize");
+
+    // the untracked pass reports the error the same way
+    let mut it = h.iter_untracked();
+    assert_eq!(it.by_ref().count(), 0);
+    assert_eq!(it.error().map(|e| e as i32), Some(libc::ENOTDIR), "error must surface");
+    drop(it);
 
     let err = h.state_current().expect_err("a partial listing must not pass as state");
     assert_eq!(err.raw_os_error(), Some(libc::ENOTDIR), "{err}");

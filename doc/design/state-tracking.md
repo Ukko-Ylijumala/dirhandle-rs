@@ -15,7 +15,7 @@ Each `DirHandle` carries a `DirectoryState` snapshot:
 
 ## When state is computed
 
-State population is **lazy and one-shot per handle** by default. `DirHandleIter::new` enables its `update` flag only when `state.when.is_none()` — i.e., the very first time the handle is iterated. Subsequent calls to `iter()` do **not** refresh the state, even if the directory has changed externally. Only a clean, complete pass finalises the state: early drops and `readdir` errors skip the update.
+State population is **lazy and one-shot per handle** by default. `DirHandleIter::new` enables its `update` flag only when `state.when.is_none()` — i.e., the very first time the handle is iterated. Subsequent calls to `iter()` do **not** refresh the state, even if the directory has changed externally. Only a clean, complete pass finalises the state: early drops and `readdir` errors skip the update. `iter_untracked()` passes never do (they neither take the directory stamp nor digest the entries), so a handle iterated only that way keeps an empty `DirectoryState` until a tracked pass or `state_changed()` establishes one.
 
 To force a refresh:
 

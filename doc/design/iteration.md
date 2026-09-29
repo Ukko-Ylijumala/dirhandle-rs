@@ -1,6 +1,6 @@
 # Directory iteration
 
-`DirHandle` exposes three iteration entry points plus a low-level escape hatch. All of them filter out `.` and `..` and yield `EntryExt`.
+`DirHandle` exposes four iteration entry points plus a low-level escape hatch. All of them filter out `.` and `..` and yield `EntryExt`.
 
 Entries whose file type cannot be determined (`d_type` is `DT_UNKNOWN` and the `fstatat` fallback fails) are **yielded, not dropped** — their `file_type()` returns `None` and they classify as non-directories everywhere (lookahead heuristic, `entries()`, state counts/hashes). Dropping them would make a listable-but-unsearchable directory iterate as empty on filesystems that don't populate `d_type`.
 
@@ -10,12 +10,13 @@ On such `d_type`-less filesystems (some XFS configurations, NFS, FAT), note that
 
 - `iter()` — lookahead-buffered iterator that **preferentially** yields directory entries before others. Rewinds the inner `nix::dir::Iter` when exhausted, so the handle can be iterated repeatedly.
 - `iter_stat()` — same as `iter()`, but `stat()`s each entry eagerly before yielding.
+- `iter_untracked()` — a plain pass (straight `readdir` order, see below) that also skips state tracking: no `DirectoryState` is computed, so no directory `fstat` and no per-entry digest. For scanners that collect or partition the entries themselves and never use the handle's state; the handle's `DirectoryState` is left as it was.
 - `iter_sorted()` — materialises both dir and file lists, sorts each alphabetically, and yields all directories first then all files. Returns a `DirHandleIterSorted` that owns the materialised vec.
 - `unsafe raw_iter()` — peekable view of the raw `nix::dir::Iter`, including `.`/`..`. Marked `unsafe` to flag the thread-safety constraint described below.
 
 There is also `entries(dirs, files)` / `entries_sorted()` for non-iterator access, returning `(EntryVec, EntryVec)` tuples.
 
-`entries()`, and therefore `iter_sorted()` / `entries_sorted()`, plus the internal `directory_state()` pass run `DirHandleIter` in **plain mode**: a straight pass with no lookahead buffer, since the result gets partitioned and usually sorted afterwards anyway. Plain mode keeps the `.`/`..` filtering, the sticky-error semantics and the lazy `DirectoryState` finalisation; only the dir-first reordering is skipped.
+`entries()`, and therefore `iter_sorted()` / `entries_sorted()`, plus the internal `directory_state()` pass run `DirHandleIter` in **plain mode**: a straight pass with no lookahead buffer, since the result gets partitioned and usually sorted afterwards anyway. Plain mode keeps the `.`/`..` filtering, the sticky-error semantics and the lazy `DirectoryState` finalisation; only the dir-first reordering is skipped. `iter_untracked()` is plain mode with the finalisation switched off as well.
 
 ## Dir-first lookahead
 

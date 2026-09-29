@@ -1264,6 +1264,25 @@ impl DirHandle {
     }
 
     /**
+    A pass for callers that only want the entries: straight `readdir`
+    order, **without** the dir-first lookahead of `iter()` and **without**
+    state tracking - no [DirectoryState] is computed, so the pass costs no
+    directory `fstat` and no per-entry digest. Meant for scanners that
+    collect or partition the entries themselves and never ask this handle
+    for `state()` / `state_changed()`, e.g. a one-shot recursive walk.
+
+    Everything else is as in `iter()`: `.` and `..` are skipped, the
+    stream rewinds when the iterator drops, and a `readdir` error ends
+    the pass (see `DirHandleIter::error()`).
+
+    The handle's [DirectoryState] is left untouched; a later `iter()` or
+    `state_changed()` still establishes it lazily.
+    */
+    pub fn iter_untracked(&'_ mut self) -> DirHandleIter<'_> {
+        DirHandleIter::with_update(self, false, false).plain()
+    }
+
+    /**
     Return the directory entries as a tuple of directories and files.
     The booleans specify whether to include directories and/or files.
     Entries whose type cannot be determined count as files (non-dirs).
