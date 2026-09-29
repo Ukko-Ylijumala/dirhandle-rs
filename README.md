@@ -2,9 +2,9 @@
 
 > [!WARNING]
 > **WORK IN PROGRESS — pre-1.0, no stability guarantees.**
-> This crate is at version `0.3.x` and the public API is **actively churning**.
-> Breaking changes between minor and patch versions are expected.
-> There are currently **no automated tests** and the crate is **not published to crates.io**.
+> This crate is at version `0.6.x` and the public API is **actively churning**.
+> Breaking changes are expected; they come with a minor version bump (`0.5.x` → `0.6.0`), while patch releases stay non-breaking.
+> The test suite only runs on the developer's machine (no CI), and the crate is **not published to crates.io**.
 > Do not pin this in production code that you cannot easily update.
 
 > [!IMPORTANT]
@@ -21,7 +21,7 @@
 
 - **Atomic file-descriptor wrapper (`DirFd`)** with sign-encoded open / uninitialized / stale state.
 - **Extended directory entries (`EntryExt`)** with `OnceLock`-cached `stat()` results and `std::fs::DirEntry`-compatible accessors.
-- **Hardened entry open** — `openat2` with `RESOLVE_BENEATH` rejects path traversals at the kernel boundary.
+- **Hardened entry open** — `openat2` with `RESOLVE_BENEATH` rejects path traversals at the kernel boundary, and `open_dir()` never follows symlinks, so tree walks cannot loop or be redirected.
 - **Change detection (`DirectoryState`)** tracking dir/file counts and stable `xxh3` hashes.
 - **Lookahead iteration (`DirHandleIter`)** that preferentially yields directory entries before files.
 - **Thread-safe handle pool (`OpenHandles`)** built on `DashMap` with explicit checkout semantics.
@@ -29,13 +29,13 @@
 
 ## Project status
 
-This library started life as a component inside a larger application and was extracted into its own crate. As of `0.5.x`:
+This library started life as a component inside a larger application and was extracted into its own crate. As of `0.6.x`:
 
-- The public API is **unstable**. Method signatures, field names, and type shapes may change without notice (`0.5.0` removed `EntryExt`'s `Deref<Target = nix::dir::Entry>`, for example).
-- The stored `DirectoryState` hash values are stable within a minor series only; the digest scheme changed in `0.4.0` and `0.5.0` (see [`doc/design/state-tracking.md`](doc/design/state-tracking.md)).
+- The public API is **unstable**. Method signatures, field names, and type shapes may change with any minor version (`0.5.0` removed `EntryExt`'s `Deref<Target = nix::dir::Entry>`, `0.6.0` moved to `nix` 0.31, whose types appear in the API).
+- The stored `DirectoryState` hash values are stable within a minor series only; the digest scheme changed in `0.4.0` and `0.5.0`, and `0.6.0` kept it (see [`doc/design/state-tracking.md`](doc/design/state-tracking.md)).
 - There is a test suite (`cargo test`: unit tests in `src/lib.rs`, integration tests in `tests/`), but it only runs on the developer's machine.
 - The crate is **not published to crates.io** (`publish = false`). It is consumed as a git dependency only.
-- Several transitive dependencies (`custom_xxh3`, `timesince`, `miniutils`, `enhvec`, and a temporary fork of `size-of`) are also git-only. Expect occasional build breakage if those repos move.
+- Several dependencies (`custom_xxh3`, `timesince`, `miniutils`, `enhvec`, and a temporary fork of `size-of`) are also git-only. Expect occasional build breakage if those repos move.
 - Tested on Linux with recent stable Rust. **No CI is configured.**
 
 If any of the above is a dealbreaker for your use case, please wait for a `1.0` release before depending on this crate.
@@ -52,6 +52,8 @@ If any of the above is a dealbreaker for your use case, please wait for a `1.0` 
 [dependencies]
 dirhandle = { git = "https://github.com/Ukko-Ylijumala/dirhandle-rs" }
 ```
+
+`nix` types (`Entry`, `Type`, `Errno`, ...) are part of the API. The crate re-exports the `nix` it was built with as `dirhandle::nix`, so name them through that rather than through a separate `nix` dependency that may be a different version.
 
 Enable optional memory accounting:
 
@@ -139,4 +141,5 @@ Contributions are welcome, but please note that the API is still in flux. Openin
 - `0.5.0` — **breaking**: compact `EntryExt` (≤ 80 bytes, no `Deref<Target = Entry>`; `file_name()`/`ino()`/`d_type()` are inherent, `new()` takes `&Entry`). **Digest scheme change**: commutative fold instead of sort-then-hash, `typenum()` yields kernel `DT_*` values.
 - `0.5.1` — README refresh, `d_type` fallback test, clippy sweep, `EntryExt::open()` without `unsafe`.
 - `0.5.2` — `DirHandle::path()` / `DirFd::path()` / `EntryExt::path()` fail with `NotFound` once the directory has been deleted, instead of returning procfs's `"<path> (deleted)"` string.
-- `0.5.3` — current. Fixes: `state_changed_fast()` compares the directory's timestamps with those recorded by the baseline pass instead of with the local clock, so server clock skew or a stale NFS attribute cache can no longer hide a change; `DirHandle::from_fd()` closes the fds it rejects instead of leaking them; `size_of` charges each handle its actual glibc stream buffer (`st_blksize`, 32 KiB .. 1 MiB) instead of a fixed 32 KiB.
+- `0.5.3` — fixes: `state_changed_fast()` compares the directory's timestamps with those recorded by the baseline pass instead of with the local clock, so server clock skew or a stale NFS attribute cache can no longer hide a change; `DirHandle::from_fd()` closes the fds it rejects instead of leaking them; `size_of` charges each handle its actual glibc stream buffer (`st_blksize`, 32 KiB .. 1 MiB) instead of a fixed 32 KiB.
+- `0.6.0` — current. **Breaking**: `nix` 0.31 — with 0.30, `readdir` errors looked like a clean end of the listing, so partial listings were stored as the directory's state and never reported; nix types are part of the API, so the crate re-exports `dirhandle::nix`. `EntryExt::open_dir()` no longer follows symlinks, not even in-tree ones (`ENOTDIR`). `DirFd::new()` takes `&Fd` (by value it closed an owned fd on the spot). Perf: ~10% faster iteration from nix 0.31, one-shot per-entry digests (~2x faster, same values).

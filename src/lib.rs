@@ -4,7 +4,7 @@
 // re-export the crate: downstream can name them without a version-matched dep
 pub use nix;
 
-use custom_xxh3::{CustomXxh3Hasher, Xxh3Hashable};
+use custom_xxh3::{hash_bytes, CustomXxh3Hasher, Xxh3Hashable};
 use dashmap::{mapref::one::RefMut, DashMap};
 use enhvec::{EnhVec, Sorting};
 use miniutils::{ToDebug, ToDisplay};
@@ -76,6 +76,12 @@ variant's `Box`) while fitting names of up to 38 bytes inline - UUIDs
 (36) included. Anything longer takes one heap allocation.
 */
 const NAME_INLINE_CAP: usize = 39;
+/*
+Stack buffer for the one-shot per-entry digest (`EntryExt::xxh3_digest`):
+a name of up to `NAME_MAX` bytes, the 8-byte inode and the typenum byte.
+Longer names (beyond `NAME_MAX`, e.g. from CIFS) take the streaming path.
+*/
+const DIGEST_BUF_SIZE: usize = libc::NAME_MAX as usize + 8 + 1;
 /*
 Heap footprint of one open directory stream as allocated by glibc's
 `opendir` / `fdopendir` (`sysdeps/posix/opendir.c`): a `struct __dirstream`
@@ -776,10 +782,27 @@ impl<'h> Xxh3Hashable for EntryExt<'h> {
         state.write_u8(self.typenum());
     }
 
+    /**
+    One-shot xxh3 over the exact bytes `xxh3()` streams - name, native
+    endian inode, typenum - laid out in a stack buffer. xxh3's streaming
+    and one-shot forms agree for the same input and secret, so digests are
+    bit-identical (unit-tested, value pinned), but no ~700-byte streaming
+    hasher is set up per entry: ~2x faster. Names that do not fit the
+    buffer take the streaming path.
+    */
     fn xxh3_digest(&self) -> u64 {
-        let mut hasher: CustomXxh3Hasher = CustomXxh3Hasher::default();
-        self.xxh3(&mut hasher);
-        hasher.finish()
+        let name: &[u8] = self.name_as_bytes();
+        let len: usize = name.len() + 8 + 1;
+        if len > DIGEST_BUF_SIZE {
+            let mut hasher: CustomXxh3Hasher = CustomXxh3Hasher::default();
+            self.xxh3(&mut hasher);
+            return hasher.finish();
+        }
+        let mut buf: [u8; DIGEST_BUF_SIZE] = [0; DIGEST_BUF_SIZE];
+        buf[..name.len()].copy_from_slice(name);
+        buf[name.len()..len - 1].copy_from_slice(&self.ino.to_ne_bytes());
+        buf[len - 1] = self.typenum();
+        hash_bytes(&buf[..len])
     }
 }
 
@@ -2169,6 +2192,7 @@ fn next<'h>(
 mod tests {
     use super::*;
     use std::collections::hash_map::DefaultHasher;
+    use std::ffi::CString;
 
     fn siphash<T: Hash>(item: &T) -> u64 {
         let mut hasher: DefaultHasher = DefaultHasher::new();
@@ -2309,6 +2333,34 @@ mod tests {
 
         drop(h);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn one_shot_digest_matches_streaming() {
+        /*
+        The one-shot fast path must reproduce the streaming digest exactly -
+        it feeds every stored DirectoryState. Lengths straddle the inline
+        name cap, xxh3's 240-byte short-input boundary, NAME_MAX and the
+        streaming fallback beyond it.
+        */
+        let h = DirHandle::new(&std::env::temp_dir()).unwrap();
+        let entry = |name: &CStr| EntryExt {
+            name: EntryName::new(name),
+            ino: 0x0123_4567_89ab_cdef,
+            d_type: Some(Type::File),
+            dirfd: h.inner.as_fd(),
+            stat: OnceLock::new(),
+        };
+        for len in [0usize, 1, 16, 38, 39, 231, 232, 240, 255, 256, 300] {
+            let name: CString = CString::new(vec![b'a' + (len % 26) as u8; len]).unwrap();
+            let e: EntryExt = entry(&name);
+            let mut streaming: CustomXxh3Hasher = CustomXxh3Hasher::default();
+            e.xxh3(&mut streaming);
+            assert_eq!(e.xxh3_digest(), streaming.finish(), "name length {len}");
+        }
+        // value from the v0.5 streaming implementation: a change here is a
+        // digest scheme change (version note in state-tracking.md)
+        assert_eq!(entry(c"pinned-entry.dat").xxh3_digest(), 0xab33_b55a_249e_5a5e);
     }
 
     #[test]
