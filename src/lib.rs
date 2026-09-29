@@ -21,6 +21,7 @@ use std::{
     io,
     iter::Peekable,
     marker::PhantomData,
+    mem,
     ops::{Deref, DerefMut},
     os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd, RawFd},
     os::unix::ffi::OsStrExt,
@@ -48,6 +49,32 @@ minor clock skew. Timestamps within this window of the baseline are
 treated as "maybe changed" and fall through to the full comparison.
 */
 const MTIME_SLACK_SECS: f64 = 2.0;
+/*
+Stable typenum values for `EntryExt::typenum()`. They feed the
+[DirectoryState] digests, so they are pinned here instead of being derived
+from nix's [Type] discriminants (`t as u8`), which upstream could reorder
+and thereby silently change every stored hash. The values match the nix
+0.30 enum order, so digests computed by earlier 0.4.x versions stay valid.
+*/
+const TYPENUM_FIFO:    u8 = 0;
+const TYPENUM_CHR:     u8 = 1;
+const TYPENUM_DIR:     u8 = 2;
+const TYPENUM_BLK:     u8 = 3;
+const TYPENUM_REG:     u8 = 4;
+const TYPENUM_LNK:     u8 = 5;
+const TYPENUM_SOCK:    u8 = 6;
+const TYPENUM_UNKNOWN: u8 = 254;
+/*
+Heap footprint of one open directory stream as allocated by glibc's
+`opendir` / `fdopendir` (`sysdeps/posix/opendir.c`): a `struct __dirstream`
+header (fd, lock, allocation / size / offset bookkeeping, ~48 bytes)
+followed by the inline `getdents` buffer, which is `max(st_blksize, 32 KiB)`
+capped at 1 MiB. 32 KiB covers every common filesystem. `nix::dir::Dir`
+itself is only the `DIR*` and lives inline in [DirHandle]; the `dirent`
+that `readdir_r` fills is stack-allocated per call, not heap.
+*/
+#[cfg(feature = "size_of")]
+const DIR_STREAM_HEAP: usize = 32 * 1024 + 48;
 
 /**
 Since we cannot import [std::sys] directly (it's private), we need to
@@ -489,11 +516,23 @@ impl<'h> EntryExt<'h> {
         }
     }
 
-    /// Return the file type of the entry as a `u8` typenum. Unknown is 254.
+    /**
+    Return the file type of the entry as a `u8` typenum (see the
+    `TYPENUM_*` constants). This value is part of the stable state digest,
+    so it is an explicit mapping rather than nix's enum discriminant.
+    Unknown is [TYPENUM_UNKNOWN].
+    */
+    #[rustfmt::skip]
     pub fn typenum(&self) -> u8 {
         match self.file_type() {
-            Some(t) => t as u8,
-            None => 254,
+            Some(Type::Fifo)            => TYPENUM_FIFO,
+            Some(Type::CharacterDevice) => TYPENUM_CHR,
+            Some(Type::Directory)       => TYPENUM_DIR,
+            Some(Type::BlockDevice)     => TYPENUM_BLK,
+            Some(Type::File)            => TYPENUM_REG,
+            Some(Type::Symlink)         => TYPENUM_LNK,
+            Some(Type::Socket)          => TYPENUM_SOCK,
+            None                        => TYPENUM_UNKNOWN,
         }
     }
 
@@ -878,6 +917,14 @@ impl DirHandle {
     Timestamps within [MTIME_SLACK_SECS] of the baseline fall through
     to the full `state_changed()` comparison.
 
+    The baseline `when` is the time the snapshot pass **started**, not
+    when it finished: a change landing mid-pass may or may not have been
+    seen by `readdir`, so it must compare as "not older" here and force
+    the full check. Stamping the end of a pass longer than the slack
+    would let such a change slip through - and since this pre-check never
+    touches the stored state, it would keep slipping through on every
+    later call until something else bumped the directory mtime.
+
     NOTE: backdating the directory mtime (`touch -d` / `utimensat`) does
     **not** defeat the pre-check, because those calls bump ctime, which
     we also consider (verified in the integration tests). Only direct
@@ -918,8 +965,13 @@ impl DirHandle {
     NOTE: this iterator will return the special `.` and `..` entries.
 
     ## Safety
-    The returned `Iter` is **not** thread-safe and must **not** be sent to
-    another thread. It must be used only in the thread that created it.
+    There is no memory-safety precondition here: the `&mut self` borrow
+    already guarantees exclusive access to the underlying `DIR*` for the
+    iterator's lifetime, and nix's `Iter` is `Send` for that reason. The
+    `unsafe` marker is a deliberate speed bump - it forces callers to
+    acknowledge that they are bypassing the `.`/`..` filtering, the error
+    stickiness and the state tracking of the safe iterators, and that a
+    `DIR*` stream must never be read from two places at once.
     */
     pub unsafe fn raw_iter<'handle>(&'handle mut self) -> Peekable<Iter<'handle>> {
         self.inner.iter().peekable()
@@ -1058,17 +1110,12 @@ const _: () = {
 };
 
 #[cfg(feature = "size_of")]
-const DHSIZE: usize = 296;
-
-#[cfg(feature = "size_of")]
 impl SizeOf for DirHandle {
     fn size_of_children(&self, context: &mut Context) {
-        // nix::dir::Dir:
-        // - ptr::NonNull - 8 bytes
-        // - libc::DIR - 8? bytes
-        // - libc::dirent - 280 bytes
-        // Total: 296 + 8 (padding?) = 304 bytes
-        context.add(DHSIZE + 8).add_distinct_allocation();
+        // the only heap child is glibc's directory stream; our own fields
+        // (the `DIR*` and the DirectoryState) are inline and counted by
+        // the caller via `size_of::<DirHandle>()`
+        context.add(DIR_STREAM_HEAP).add_distinct_allocation();
     }
 }
 
@@ -1170,6 +1217,12 @@ pub struct DirHandleIter<'handle> {
     dirs: Vec<u64>,
     /// per-entry xxh3 digests of file entries - used for state hashing
     files: Vec<u64>,
+    /**
+    When this pass started (before the first `readdir`). Becomes the
+    `when` of the finalized [DirectoryState] - see `state_changed_fast()`
+    for why the start, and not the end, of the pass is the right stamp.
+    */
+    started: TimeSinceEpoch,
 }
 
 impl<'handle> DirHandleIter<'handle> {
@@ -1202,6 +1255,7 @@ impl<'handle> DirHandleIter<'handle> {
             update,
             dirs: Vec::new(),
             files: Vec::new(),
+            started: TimeSinceEpoch::new(),
         }
     }
 
@@ -1351,9 +1405,9 @@ impl<'handle> Iterator for DirHandleIter<'handle> {
                     self.update = false;
                     self.state.dirs = self.dirs.len();
                     self.state.files = self.files.len();
-                    self.state.hash_d = digest_of_digests(std::mem::take(&mut self.dirs));
-                    self.state.hash_f = digest_of_digests(std::mem::take(&mut self.files));
-                    self.state.when = TimeSinceEpoch::new().into();
+                    self.state.hash_d = digest_of_digests(mem::take(&mut self.dirs));
+                    self.state.hash_f = digest_of_digests(mem::take(&mut self.files));
+                    self.state.when = self.started.clone().into();
                     trace!(target: "DirHandle.state", "{:?}", self.state);
                 }
                 return None;
@@ -1422,13 +1476,17 @@ impl OpenHandles {
     internal locking using [parking_lot::RwLock].
     */
     fn checkout<'a>(&'a self, fd: RawFd) -> Option<CheckedOutHandle<'a>> {
-        let ref_handle: RefMut<'a, RawFd, DirHandle> = self.0.get_mut(&fd)?;
-        Some(CheckedOutHandle {
+        Some(self.wrap(self.0.get_mut(&fd)?))
+    }
+
+    /// Wrap an already write-locked map entry into a [CheckedOutHandle].
+    fn wrap<'a>(&'a self, ref_handle: RefMut<'a, RawFd, DirHandle>) -> CheckedOutHandle<'a> {
+        CheckedOutHandle {
             inner: ref_handle,
             close_callback: Rc::new(|fd: i32| {
                 self.close(fd);
             }),
-        })
+        }
     }
 
     /**
@@ -1440,17 +1498,14 @@ impl OpenHandles {
     pub fn open(&'_ self, path: &Path) -> io::Result<CheckedOutHandle<'_>> {
         let handle: DirHandle = DirHandle::new(path)?;
         let fd: RawFd = handle.as_raw_fd();
-        self.0.insert(fd, handle);
         /*
-        Between the insert above and the checkout below, another thread on
-        this same OpenHandles could call close(fd) and evict our just-opened
-        handle. The fd value is freshly allocated by the kernel and the
-        race is exceedingly rare, but turning it into io::Error is cheap and
-        strictly better than panicking inside a library entry point.
+        `entry().insert()` inserts the handle and hands back the write-locked
+        `RefMut` in one step under the shard lock, so there is no window in
+        which another thread could `close(fd)` our freshly opened handle
+        between the insert and the checkout (which the previous
+        insert-then-get_mut sequence had to report as an io::Error).
         */
-        self.checkout(fd).ok_or_else(|| {
-            io::Error::other("handle closed concurrently between insert and checkout")
-        })
+        Ok(self.wrap(self.0.entry(fd).insert(handle)))
     }
 
     /// Insert a handle into the map. Replaces an existing handle with the same
@@ -1469,9 +1524,10 @@ impl OpenHandles {
         self.checkout(fd)
     }
 
-    /// Remove a handle from the map if there are no other strong refs to it.
+    /// Remove a handle from the map and hand it back to the caller (the
+    /// directory stays open - dropping the returned handle closes it).
     pub fn remove(&self, fd: RawFd) -> Option<DirHandle> {
-        self.0.remove(&fd).map(|(_, handle)| Some(handle))?
+        self.0.remove(&fd).map(|(_, handle)| handle)
     }
 
     /// Close an open directory handle and release its file descriptor.
@@ -1534,15 +1590,22 @@ unsafe impl Sync for OpenHandles {}
 impl SizeOf for OpenHandles {
     fn size_of_children(&self, context: &mut Context) {
         if self.0.capacity() > 0 {
-            let used: usize = (DHSIZE + 4) * self.0.len();
-            let total: usize = (DHSIZE + 4) * self.0.capacity();
+            /*
+            DashMap keeps `(key, value)` pairs inline in its hashbrown
+            tables, so the slot size is that tuple's size. Each handle's
+            heap children (glibc's DIR stream) are added by the recursion
+            below and must not be folded into the slot size as well - that
+            double counted every handle in earlier versions.
+            */
+            let slot: usize = mem::size_of::<(RawFd, DirHandle)>();
+            let used: usize = slot * self.0.len();
+            let total: usize = slot * self.0.capacity();
             context
                 .add(used)
                 .add_excess(total - used)
                 .add_distinct_allocation();
 
             self.0.iter().for_each(|itm| {
-                itm.key().size_of_children(context);
                 itm.value().size_of_children(context);
             });
         }
@@ -1684,6 +1747,8 @@ listing early, in which case we return the error instead of a partial
 */
 #[instrument(level = "trace", skip_all, ret)]
 fn directory_state(dir: &mut DirHandle) -> io::Result<DirectoryState> {
+    // stamped before the first readdir - see `state_changed_fast()`
+    let started: TimeSinceEpoch = TimeSinceEpoch::new();
     let mut d_digests: Vec<u64> = Vec::new();
     let mut f_digests: Vec<u64> = Vec::new();
     let mut iter: DirHandleIter = DirHandleIter::with_update(dir, false, false);
@@ -1701,7 +1766,7 @@ fn directory_state(dir: &mut DirHandle) -> io::Result<DirectoryState> {
         files: f_digests.len(),
         hash_d: digest_of_digests(d_digests),
         hash_f: digest_of_digests(f_digests),
-        when: TimeSinceEpoch::new().into(),
+        when: started.into(),
     })
 }
 
@@ -1823,6 +1888,50 @@ mod tests {
         assert_eq!(EntryType(libc::S_IFBLK).entry_t(),  Some(Type::BlockDevice));
         assert_eq!(EntryType(libc::S_IFCHR).entry_t(),  Some(Type::CharacterDevice));
         assert_eq!(EntryType(0).entry_t(), None, "DT_UNKNOWN-ish mode has no type");
+    }
+
+    #[test]
+    #[rustfmt::skip]
+    fn typenums_are_pinned() {
+        // the digest scheme depends on these exact values - they must not
+        // drift with nix's enum order (this is what `t as u8` used to be)
+        assert_eq!(TYPENUM_FIFO, Type::Fifo            as u8);
+        assert_eq!(TYPENUM_CHR,  Type::CharacterDevice as u8);
+        assert_eq!(TYPENUM_DIR,  Type::Directory       as u8);
+        assert_eq!(TYPENUM_BLK,  Type::BlockDevice     as u8);
+        assert_eq!(TYPENUM_REG,  Type::File            as u8);
+        assert_eq!(TYPENUM_LNK,  Type::Symlink         as u8);
+        assert_eq!(TYPENUM_SOCK, Type::Socket          as u8);
+        assert_eq!(TYPENUM_UNKNOWN, 254);
+    }
+
+    #[test]
+    fn state_changed_fast_short_circuits_on_old_mtime() {
+        let dir: PathBuf = std::env::temp_dir()
+            .join(format!("dirhandle-unit-{}-fast-path", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("f1"), b"1").unwrap();
+
+        let mut h = DirHandle::new(&dir).unwrap();
+        assert!(!h.state_changed_fast().unwrap(), "baseline");
+
+        // a modification that is real, but whose dir mtime/ctime are
+        // "clearly older" than the (forged) baseline, must be answered by
+        // the fstat pre-check alone - i.e. the early-return branch
+        std::fs::write(dir.join("f2"), b"2").unwrap();
+        let far_future: f64 = TimeSinceEpoch::new().get() + 1e6;
+        h.state.when = Some(TimeSinceEpoch::new_from(far_future));
+        assert!(!h.state_changed_fast().unwrap(), "pre-check must short-circuit");
+        assert_eq!(h.state.files, 1, "short-circuit must not touch the stored state");
+
+        // and with an honest baseline the full path sees the change
+        h.state.when = Some(TimeSinceEpoch::new_from(0.0));
+        assert!(h.state_changed_fast().unwrap(), "full comparison must run");
+        assert_eq!(h.state.files, 2);
+
+        drop(h);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

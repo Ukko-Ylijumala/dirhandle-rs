@@ -316,6 +316,35 @@ fn state_changed_fast_lifecycle() {
     assert!(h.state_changed_fast().unwrap(), "ctime guard must catch backdated mtime");
 }
 
+#[test]
+fn state_when_is_stamped_at_pass_start() {
+    /*
+    Regression: `when` used to be stamped at the *end* of a pass. A change
+    landing early in a pass longer than MTIME_SLACK_SECS then had an mtime
+    "clearly older" than the baseline, so `state_changed_fast()` reported
+    unchanged forever, even though the listing had never seen the entry.
+    */
+    let td = TestDir::new("state-when");
+    for i in 0..5 {
+        td.file(&format!("f{i}"), b"x");
+    }
+
+    let mut h = DirHandle::new(td.path()).unwrap();
+    {
+        // lazy first pass: the first next() makes glibc slurp the whole
+        // (small) directory into its buffer, so the file created below is
+        // not seen by this pass
+        let mut it = h.iter();
+        let _ = it.next();
+        td.file("late", b"x"); // dir mtime = now
+        std::thread::sleep(std::time::Duration::from_millis(2500)); // > slack
+        let n: usize = 1 + it.by_ref().count();
+        assert_eq!(n, 5, "the late file must not have been listed");
+    } // clean exhaustion finalizes the state
+    assert_ne!(h.state(), &DirectoryState::default(), "state must be populated");
+    assert!(h.state_changed_fast().unwrap(), "mid-pass change must be detected");
+}
+
 /* ########################## v0.4.1 ADDITIONS ############################# */
 
 #[test]

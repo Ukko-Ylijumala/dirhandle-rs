@@ -16,7 +16,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - `publish = false` in `Cargo.toml`; downstream projects consume this crate via git dependency, not crates.io.
 - Several dependencies (`custom_xxh3`, `timesince`, `miniutils`, `enhvec`, and a fork of `size-of`) are pulled from `github.com/Ukko-Ylijumala/*` git repos. The `size-of` fork specifically exists to work around a Rust ≥1.89 compiler error (E0570) in upstream — do not switch back to upstream `size-of` without verifying the fix is published.
 - Linux-only: depends on `nix` (`fs` + `dir` features), `libc::stat`/`mode_t`, and `/proc/self/fd` for fd→path resolution. Anything that breaks procfs availability breaks `DirFd::path()` and `DirHandle::path()` by design (they return `io::Error` rather than panicking).
-- `#![allow(dead_code)]` is set crate-wide — dead-code warnings will not flag unused helpers.
+- There is no crate-wide `#![allow(dead_code)]`; the few intentionally unused helpers carry `#[expect(dead_code)]`, which fails the build if the helper gains a caller — remove the attribute when wiring one up.
 
 ## Design docs
 
@@ -30,7 +30,8 @@ The interesting design decisions are split out under `doc/design/`. Read the rel
 
 ## Editing pitfalls
 
-- The `SizeOf` impls hard-code `DHSIZE = 296` from the layout of `nix::dir::Dir` + `libc::DIR` + `libc::dirent`. Re-verify if `nix` or `libc` changes representation.
+- The `SizeOf` impls hard-code `DIR_STREAM_HEAP` (32 KiB + header) as the per-handle heap cost: glibc's `opendir`/`fdopendir` allocate a `struct __dirstream` with an inline `getdents` buffer of `max(st_blksize, 32 KiB)`. Re-verify if glibc's `sysdeps/posix/opendir.c` changes.
+- `EntryExt::typenum()` uses the pinned `TYPENUM_*` constants, never `Type as u8`: the values are part of the stable `DirectoryState` digests.
 - `tracing` is used with explicit `target = "..."` strings throughout. Preserve targets when adding or moving log statements so downstream filters keep working.
 - nix's `Iter` rewinds the underlying `Dir` on drop (early or exhausted), so a partially-consumed `DirHandleIter` never leaves the `Dir` mid-stream. `DirectoryState` finalisation is stricter: it only happens on a clean, complete pass — early drops and `readdir` errors skip the state update.
 - Never delegate `EntryExt`'s `Hash`/`PartialEq` back to `nix::dir::Entry`'s derived impls: nix only initialises `d_reclen` bytes of the dirent, while the libc derives read the full struct including uninitialized `d_name` tail bytes.

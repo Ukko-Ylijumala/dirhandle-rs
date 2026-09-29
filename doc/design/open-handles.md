@@ -6,7 +6,7 @@
 
 DashMap provides per-shard `parking_lot::RwLock` concurrency. `OpenHandles` exposes:
 
-- `open(path)` — opens a new `DirHandle`, inserts it, returns a checked-out reference.
+- `open(path)` — opens a new `DirHandle`, inserts it and returns a checked-out reference in one step (`DashMap::entry().insert()` hands back the write-locked `RefMut` directly, so a concurrent `close(fd)` cannot slip in between insert and checkout).
 - `get(fd)` — returns a checked-out reference if the fd is in the pool.
 - `insert(handle)` — stores a handle; replaces any existing entry under the same fd.
 - `close(fd)` / `close_all()` — drops the handle(s), closing the underlying file descriptor(s).
@@ -27,7 +27,7 @@ The simplest discipline: drop or `close()` the current checkout before requestin
 
 ## Lifecycle
 
-`CheckedOutHandle::close(self)` explicitly drops the `RefMut` before invoking the close callback. This ordering matters: the callback calls `OpenHandles::close(fd)`, which itself acquires a write lock, so the existing `RefMut` must be released first or you hit the same deadlock pattern described above. The unlock-then-remove sequence opens a tiny fd-reuse window (another thread closes the fd, the kernel recycles the number for a fresh handle, and the remove evicts the newcomer) — the same race family as documented on `open()`; both are inherent to keying the pool by `RawFd`.
+`CheckedOutHandle::close(self)` explicitly drops the `RefMut` before invoking the close callback. This ordering matters: the callback calls `OpenHandles::close(fd)`, which itself acquires a write lock, so the existing `RefMut` must be released first or you hit the same deadlock pattern described above. The unlock-then-remove sequence opens a tiny fd-reuse window (another thread closes the fd, the kernel recycles the number for a fresh handle, and the remove evicts the newcomer) — inherent to keying the pool by `RawFd`.
 
 The map being keyed by `RawFd` also means the pool is sound only while each entry's fd number is owned by its `DirHandle`'s inner `Dir` — which `Dir` guarantees (it closes the fd only on drop, i.e. on removal from the map).
 
@@ -35,4 +35,4 @@ Dropping a `CheckedOutHandle` without calling `close()` simply releases the lock
 
 ## SizeOf accounting
 
-Under the `size_of` feature, `OpenHandles` reports memory usage including unused DashMap capacity (`add_excess(...)`) and recurses into each entry. The per-handle cost uses `DHSIZE = 296`, hard-coded from the layout of `nix::dir::Dir` + `libc::DIR` + `libc::dirent`. Re-verify if either dependency changes its representation.
+Under the `size_of` feature, `OpenHandles` reports the inline `(RawFd, DirHandle)` slot cost for used and unused DashMap capacity (`add_excess(...)`) and recurses into each entry for its heap children. A handle's heap child is glibc's directory stream: `DIR_STREAM_HEAP` (32 KiB buffer + header), since `opendir`/`fdopendir` allocate `max(st_blksize, 32 KiB)` for `getdents`. This dominates the footprint — a pool of 10k handles is on the order of 320 MiB, not the ~3 MB the old `DHSIZE = 296` estimate implied. Re-verify if glibc's `sysdeps/posix/opendir.c` changes.
