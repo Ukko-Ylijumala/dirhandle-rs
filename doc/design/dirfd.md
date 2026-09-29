@@ -20,6 +20,8 @@ The stale encoding uses `!fd` rather than `-fd` so that the unique sentinel `0` 
 
 `clear()` encodes the current open fd as `!current` if open, otherwise overwrites with `UNINIT_FD` (`i32::MIN`). A second `clear()` on an already-stale `DirFd` therefore "buries" it to uninitialized, losing the historical fd number — by design, since a thread holding a stale handle shouldn't pretend it still knows what was there.
 
+Construction (`new(&fd)`, `From<RawFd>`, `DirHandle::fd()`) only snapshots the number; a `DirFd` never owns or closes an fd. `new()` takes a reference since 0.6.0 — by value it dropped, and thereby closed, an owned `File`/`OwnedFd` on the spot, leaving a `DirFd` that reported an open fd.
+
 `set()` is fail-safe: it refuses to overwrite a currently-open fd, returning `Err(existing)`. Callers must `clear()` first if they really mean to replace the fd.
 
 Both `set()` and `clear()` use `AtomicI32::fetch_update`, so the check-and-store is a single CAS loop. Two concurrent `set()` calls cannot both succeed, and a `clear()` interleaved with a `set()` either fully precedes or fully follows it — never lands between the check and the store.

@@ -163,7 +163,13 @@ Mapping:
 pub struct DirFd(AtomicI32);
 
 impl DirFd {
-    pub fn new<Fd: AsRawFd>(fd: Fd) -> Self {
+    /**
+    Snapshot the raw fd of `fd`, which stays owned by the caller - a
+    [DirFd] never closes anything. Takes a reference: by value, an owned
+    `File` / `OwnedFd` was dropped (and closed) inside `new()`, leaving a
+    `DirFd` that claimed an open fd.
+    */
+    pub fn new<Fd: AsRawFd>(fd: &Fd) -> Self {
         DirFd(fd.as_raw_fd().into())
     }
 
@@ -2197,6 +2203,15 @@ mod tests {
         assert_eq!(zero.fd(), -1);
         assert!(!zero.is_open());
         assert_eq!(zero.set(3), Ok(3), "stale fd may be overwritten");
+    }
+
+    #[test]
+    fn dirfd_new_borrows_the_fd() {
+        let dir: File = File::open(std::env::temp_dir()).unwrap();
+        let fd: DirFd = DirFd::new(&dir);
+        assert_eq!(fd.fd(), dir.as_raw_fd());
+        assert!(unsafe { libc::fcntl(fd.fd(), libc::F_GETFD) } >= 0, "fd must stay open");
+        assert!(fd.path().is_ok());
     }
 
     #[test]
