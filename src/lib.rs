@@ -3,7 +3,6 @@
 use custom_xxh3::{CustomXxh3Hasher, Xxh3Hashable};
 use dashmap::{mapref::one::RefMut, DashMap};
 use enhvec::{EnhVec, Sorting};
-use libc;
 use miniutils::{ToDebug, ToDisplay};
 use nix::{
     dir::{Dir, Entry, Iter, Type},
@@ -22,7 +21,7 @@ use std::{
     iter::Peekable,
     marker::PhantomData,
     ops::{Deref, DerefMut},
-    os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd, RawFd},
+    os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd},
     os::unix::ffi::OsStrExt,
     path::{Path, PathBuf},
     rc::Rc,
@@ -238,7 +237,7 @@ impl Default for DirFd {
 impl PartialOrd for DirFd {
     #[inline]
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        self.fd().partial_cmp(&other.fd())
+        Some(self.cmp(other))
     }
 }
 
@@ -502,10 +501,7 @@ impl<'h> EntryExt<'h> {
 
     /// Return the mode of the file as a [libc::mode_t] value (`u32`).
     pub fn mode(&self) -> Option<libc::mode_t> {
-        match self.stat() {
-            Some(stat) => Some(stat.st_mode),
-            None => None,
-        }
+        self.stat().map(|s: libc::stat| s.st_mode)
     }
 
     /// Whether the entry is a zero-length file (or stat() failed; see `len()`).
@@ -525,8 +521,11 @@ impl<'h> EntryExt<'h> {
     }
 
     /// Number of hard links to the entry, if it can be stat()ed.
+    // `nlink_t` is u64 on x86_64 but u32 on e.g. aarch64; `From` covers both,
+    // and on the former clippy sees an identity conversion - by design.
+    #[allow(clippy::useless_conversion)]
     pub fn nlink(&self) -> Option<u64> {
-        self.stat().map(|s: libc::stat| s.st_nlink as u64)
+        self.stat().map(|s: libc::stat| u64::from(s.st_nlink))
     }
 
     /**
@@ -558,8 +557,8 @@ impl<'h> EntryExt<'h> {
         let open_how: OpenHow = OpenHow::new()
             .flags(flags | OFlag::O_CLOEXEC)
             .resolve(ResolveFlag::RESOLVE_BENEATH);
-        let fd = openat2(&self.dirfd, self.file_name(), open_how)?;
-        Ok(unsafe { File::from_raw_fd(fd.into_raw_fd()) })
+        let fd: OwnedFd = openat2(self.dirfd, self.file_name(), open_how)?;
+        Ok(File::from(fd))
     }
 
     /// Open this entry for reading as a [std::fs::File] object.
@@ -587,7 +586,7 @@ impl<'h> EntryExt<'h> {
         let open_how: OpenHow = OpenHow::new()
             .flags(flags)
             .resolve(ResolveFlag::RESOLVE_BENEATH);
-        let fd: OwnedFd = openat2(&self.dirfd, self.file_name(), open_how)?;
+        let fd: OwnedFd = openat2(self.dirfd, self.file_name(), open_how)?;
         DirHandle::from_fd(fd)
     }
 
@@ -777,17 +776,14 @@ pub enum StateChange {
 
 impl StateChange {
     pub fn is_same(&self) -> bool {
-        match self {
-            StateChange::Unchanged => true,
-            _ => false,
-        }
+        matches!(self, StateChange::Unchanged)
     }
 }
 
 /* --------------------------------- */
 
 /// This struct holds the state of a directory for change detection.
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct DirectoryState {
     dirs: usize,
     files: usize,
@@ -833,18 +829,6 @@ impl DirectoryState {
     /// Combined hash of directory and file entry hashes.
     pub fn hash_all(&self) -> u64 {
         self.hash_d.rotate_left(32) ^ self.hash_f
-    }
-}
-
-impl Default for DirectoryState {
-    fn default() -> Self {
-        Self {
-            dirs: 0,
-            files: 0,
-            hash_d: 0,
-            hash_f: 0,
-            when: None,
-        }
     }
 }
 
@@ -973,7 +957,7 @@ impl DirHandle {
     `/proc/self/fd` to resolve the path by file descriptor.
     */
     pub fn path(&self) -> io::Result<PathBuf> {
-        Ok(self.fd().path()?)
+        self.fd().path()
     }
 
     /// Stored state of the directory as a [DirectoryState] object.
@@ -1170,7 +1154,7 @@ impl DirHandle {
         dirs.sort(Sorting::Descending);
         files.sort(Sorting::Descending);
         files.extend(dirs);
-        DirHandleIterSorted(files, PhantomData)
+        DirHandleIterSorted(files)
     }
 }
 
@@ -1558,11 +1542,12 @@ impl<'handle> Iterator for DirHandleIter<'handle> {
 /**
 A sorted iterator over the entries in a directory.
 
-The lifetime parameter `'handle` is used to annotate that the entries
-in the Vec are only valid while the parent [DirHandle] object exists.
+The `'handle` lifetime comes from the entries themselves (each holds a
+`BorrowedFd<'handle>` of the parent [DirHandle]), so the vec cannot
+outlive the handle - no extra marker needed.
 */
 #[derive(Debug)]
-pub struct DirHandleIterSorted<'handle>(EntryVec<'handle>, PhantomData<&'handle DirHandle>);
+pub struct DirHandleIterSorted<'handle>(EntryVec<'handle>);
 
 impl<'handle> Iterator for DirHandleIterSorted<'handle> {
     type Item = EntryExt<'handle>;
@@ -1593,6 +1578,10 @@ impl OpenHandles {
 
     pub fn len(&self) -> usize {
         self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
     }
 
     /// Whether we have such file descriptor.
@@ -1867,7 +1856,7 @@ fn get_dir_handle(path: &Path) -> io::Result<Dir> {
 /// Open a file and return its handle.
 #[expect(dead_code)]
 fn get_file_handle(path: &Path) -> io::Result<File> {
-    Ok(OpenOptions::new().read(true).open(path)?)
+    OpenOptions::new().read(true).open(path)
 }
 
 /**
@@ -2089,6 +2078,63 @@ mod tests {
         assert_eq!(TYPENUM_REG,     8);
         assert_eq!(TYPENUM_LNK,    10);
         assert_eq!(TYPENUM_SOCK,   12);
+    }
+
+    #[test]
+    fn file_type_falls_back_to_stat_without_d_type() {
+        /*
+        Filesystems that report DT_UNKNOWN (XFS without ftype, some NFS)
+        are not available here, so simulate one: rebuild each entry with
+        `d_type: None` and an empty stat cache, and check that the
+        `fstatat` fallback resolves the same type as `d_type` did.
+        */
+        let dir: PathBuf = std::env::temp_dir()
+            .join(format!("dirhandle-unit-{}-dtype", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("plain"), b"x").unwrap();
+        std::fs::create_dir(dir.join("sub")).unwrap();
+        std::os::unix::fs::symlink("plain", dir.join("link")).unwrap();
+
+        let mut h = DirHandle::new(&dir).unwrap();
+        let mut seen: usize = 0;
+        for e in h.iter() {
+            let via_dtype: Option<Type> = e.file_type();
+            assert!(via_dtype.is_some(), "tmpfs/ext4 must report d_type for {e:?}");
+            let untyped = EntryExt {
+                d_type: None,
+                stat: OnceLock::new(),
+                ..e.clone()
+            };
+            assert!(!untyped.is_statted());
+            assert_eq!(untyped.d_type(), None);
+            assert_eq!(untyped.file_type(), via_dtype, "fallback must agree for {e:?}");
+            assert!(untyped.is_statted(), "fallback must go through stat()");
+            assert_eq!(untyped.typenum(), e.typenum());
+            assert_eq!(untyped.is_dir(), e.is_dir());
+            assert_eq!(untyped.is_symlink(), e.is_symlink());
+            seen += 1;
+        }
+        assert_eq!(seen, 3);
+
+        // d_type unknown AND stat failing: yielded as "type unknown", counted
+        // as a non-directory, typenum = DT_UNKNOWN
+        let dirfd: BorrowedFd = h.inner.as_fd();
+        let ghost = EntryExt {
+            name: EntryName::new(c"does-not-exist"),
+            ino: 0,
+            d_type: None,
+            dirfd,
+            stat: OnceLock::new(),
+        };
+        assert_eq!(ghost.file_type(), None);
+        assert_eq!(ghost.typenum(), TYPENUM_UNKNOWN);
+        assert!(!ghost.is_dir());
+        assert_eq!(ghost.len(), 0);
+        assert!(ghost.is_statted(), "the failed stat must be cached too");
+
+        drop(h);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

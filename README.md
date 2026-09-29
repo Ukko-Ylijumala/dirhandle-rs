@@ -29,10 +29,11 @@
 
 ## Project status
 
-This library started life as a component inside a larger application and was extracted into its own crate. As of `0.3.8`:
+This library started life as a component inside a larger application and was extracted into its own crate. As of `0.5.x`:
 
-- The public API is **unstable**. Method signatures, field names, and type shapes may change without notice.
-- There is **no test suite** in this repository. Verify any integration against your own tests.
+- The public API is **unstable**. Method signatures, field names, and type shapes may change without notice (`0.5.0` removed `EntryExt`'s `Deref<Target = nix::dir::Entry>`, for example).
+- The stored `DirectoryState` hash values are stable within a minor series only; the digest scheme changed in `0.4.0` and `0.5.0` (see [`doc/design/state-tracking.md`](doc/design/state-tracking.md)).
+- There is a test suite (`cargo test`: unit tests in `src/lib.rs`, integration tests in `tests/`), but it only runs on the developer's machine.
 - The crate is **not published to crates.io** (`publish = false`). It is consumed as a git dependency only.
 - Several transitive dependencies (`custom_xxh3`, `timesince`, `miniutils`, `enhvec`, and a temporary fork of `size-of`) are also git-only. Expect occasional build breakage if those repos move.
 - Tested on Linux with recent stable Rust. **No CI is configured.**
@@ -80,12 +81,12 @@ for entry in handle.iter() {
 ```rust
 let _ = handle.iter().count(); // populate initial state
 // ... time passes, directory may change ...
-if handle.state_changed() {
+if handle.state_changed()? {
     println!("Directory contents changed!");
 }
 ```
 
-`state_changed()` re-scans the directory; it does not subscribe to inotify or similar. See [`doc/design/state-tracking.md`](doc/design/state-tracking.md) for the change-detection model and its lazy-population semantics.
+`state_changed()` re-scans the directory (`state_changed_fast()` first checks the directory's own mtime/ctime and skips the re-scan when they are clearly older than the baseline); neither subscribes to inotify or similar. See [`doc/design/state-tracking.md`](doc/design/state-tracking.md) for the change-detection model and its lazy-population semantics.
 
 ### Manage many handles concurrently
 
@@ -117,7 +118,7 @@ For non-trivial integration or contribution, read the design notes under [`doc/d
 
 ## License
 
-Copyright (c) 2024–2025 Mikko Tanner. All rights reserved.
+Copyright (c) 2024–2026 Mikko Tanner. All rights reserved.
 
 License: MIT OR Apache-2.0
 
@@ -128,4 +129,12 @@ Contributions are welcome, but please note that the API is still in flux. Openin
 ## Version history
 
 - `0.3.5` — initial extracted-library release: split `DirHandle` code from a larger application.
-- `0.3.8` — current. `EntryExt::name()` returns `String`, `AsFd` impl on `DirFd`, `nix` 0.30, temporary `size-of` fork to work around Rust ≥ 1.89 E0570.
+- `0.3.8` — `EntryExt::name()` returns `String`, `AsFd` impl on `DirFd`, `nix` 0.30, temporary `size-of` fork to work around Rust ≥ 1.89 E0570.
+- `0.3.9` — `DirFd` state machine re-encoded so fd 0 is a valid open fd, atomic `set`/`clear`, `as_fd()` panics instead of UB on a closed fd; `EntryExt` lifetime-bound to its `DirHandle`; `DT_UNKNOWN` entries are yielded instead of dropped; `StateChange` deltas are positive for "added".
+- `0.3.10` — correctness fixes for path resolution (non-UTF-8 names, procfs detection), error handling and fd hygiene (`O_CLOEXEC`, `O_DIRECTORY`).
+- `0.4.0` — entry identity over explicit `(name, ino, dirfd)` fields; sticky `readdir` errors end a pass instead of spinning; state finalised only on clean passes. **Digest scheme change** (sorted per-entry digests).
+- `0.4.1` — `EntryExt::open_dir()` (`openat2` + `RESOLVE_BENEATH` descent), `DirHandle::from_fd()`, `DirHandle::stat()`/`mtime()`, `state_changed_fast()`, `uid`/`gid`/`nlink`/`mtime`/`atime`/`ctime` accessors.
+- `0.4.2` — unit and integration test harnesses.
+- `0.4.3` — fixes: `DirectoryState.when` stamped at pass start (mid-pass changes could otherwise evade `state_changed_fast()` permanently), atomic insert+checkout in `OpenHandles::open`, `size_of` accounting. Perf: plain iteration mode for `entries()`/`iter_sorted()`, O(1) lookahead pop, allocation-free `CheckedOutHandle`.
+- `0.5.0` — **breaking**: compact `EntryExt` (≤ 80 bytes, no `Deref<Target = Entry>`; `file_name()`/`ino()`/`d_type()` are inherent, `new()` takes `&Entry`). **Digest scheme change**: commutative fold instead of sort-then-hash, `typenum()` yields kernel `DT_*` values.
+- `0.5.1` — current. README refresh, `d_type` fallback test, clippy sweep, `EntryExt::open()` without `unsafe`.
