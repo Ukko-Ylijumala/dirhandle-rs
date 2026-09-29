@@ -8,8 +8,9 @@ use std::collections::hash_map::DefaultHasher;
 use std::ffi::{CString, OsStr};
 use std::fs;
 use std::hash::{Hash, Hasher};
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 /* ############################### HELPERS ################################# */
@@ -59,6 +60,17 @@ fn has_cloexec(fd: i32) -> bool {
     let flags: i32 = unsafe { libc::fcntl(fd, libc::F_GETFD) };
     assert!(flags >= 0, "F_GETFD failed");
     flags & libc::FD_CLOEXEC != 0
+}
+
+/// Whether the raw fd is open *and* refers to `path` - robust against the
+/// number having been reused by a parallel test after a close.
+fn fd_refers_to(fd: i32, path: &Path) -> bool {
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(fd, &mut st) } != 0 {
+        return false;
+    }
+    let md: fs::Metadata = fs::metadata(path).unwrap();
+    st.st_dev == md.dev() && st.st_ino == md.ino()
 }
 
 /* ############################ PATH RESOLUTION ############################ */
@@ -407,9 +419,22 @@ fn from_fd_and_dir_stat() {
     let mut h = DirHandle::from_fd(owned).unwrap();
     assert_eq!(h.iter().count(), 1);
 
-    // a non-directory fd is rejected
-    let file_fd: OwnedFd = fs::File::open(td.path().join("f.txt")).unwrap().into();
-    assert!(DirHandle::from_fd(file_fd).is_err(), "ENOTDIR expected");
+    // a non-directory fd is rejected - and closed, not leaked
+    let file: PathBuf = td.path().join("f.txt");
+    let file_fd: OwnedFd = fs::File::open(&file).unwrap().into();
+    let raw: i32 = file_fd.as_raw_fd();
+    let err = DirHandle::from_fd(file_fd).expect_err("ENOTDIR expected");
+    assert_eq!(err.raw_os_error(), Some(libc::ENOTDIR), "{err}");
+    assert!(!fd_refers_to(raw, &file), "rejected fd must be closed");
+
+    // so is an O_PATH fd, which passes the type check but cannot be listed
+    let c_path: CString = CString::new(td.path().as_os_str().as_bytes()).unwrap();
+    let raw: i32 =
+        unsafe { libc::open(c_path.as_ptr(), libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC) };
+    assert!(raw >= 0, "O_PATH open failed");
+    let err = DirHandle::from_fd(unsafe { OwnedFd::from_raw_fd(raw) }).expect_err("EBADF expected");
+    assert_eq!(err.raw_os_error(), Some(libc::EBADF), "{err}");
+    assert!(!fd_refers_to(raw, td.path()), "rejected O_PATH fd must be closed");
 
     // stat/mtime of the directory itself
     let st: libc::stat = h.stat().unwrap();

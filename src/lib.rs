@@ -7,7 +7,7 @@ use miniutils::{ToDebug, ToDisplay};
 use nix::{
     dir::{Dir, Entry, Iter, Type},
     errno::Errno,
-    fcntl::{openat2, AtFlags, OFlag, OpenHow, ResolveFlag},
+    fcntl::{fcntl, openat2, AtFlags, FcntlArg, OFlag, OpenHow, ResolveFlag},
     sys::stat::{fstat, fstatat, Mode},
 };
 use std::{
@@ -589,7 +589,7 @@ impl<'h> EntryExt<'h> {
             .flags(flags)
             .resolve(ResolveFlag::RESOLVE_BENEATH);
         let fd: OwnedFd = openat2(self.dirfd, self.file_name(), open_how)?;
-        DirHandle::from_fd(fd)
+        DirHandle::from_dir_fd(fd)
     }
 
     /// The entry name as raw bytes, without the trailing NUL (no allocation).
@@ -940,10 +940,29 @@ impl DirHandle {
     /**
     Construct a [DirHandle] from an already-open directory file descriptor
     (e.g. one returned by `openat` / `openat2`). Takes ownership: the fd
-    is closed when the handle drops. Fails with `ENOTDIR` if the fd does
-    not refer to a directory.
+    is closed when the handle drops, and also when construction fails.
+    Fails with `ENOTDIR` if the fd does not refer to a directory, and with
+    `EBADF` for an `O_PATH` fd (which cannot be listed).
     */
     pub fn from_fd(fd: OwnedFd) -> io::Result<Self> {
+        /*
+        nix's `Dir::from_fd` gives up ownership (`into_raw_fd()`) before it
+        calls `fdopendir`, so an fd that `fdopendir` rejects is leaked. Screen
+        for glibc's rejection reasons while we still own the fd - the early
+        returns drop, and thereby close, it. Only an ENOMEM can still leak.
+        */
+        if !EntryType(fstat(&fd)?.st_mode).is_dir() {
+            return Err(io::Error::from_raw_os_error(libc::ENOTDIR));
+        }
+        if OFlag::from_bits_retain(fcntl(&fd, FcntlArg::F_GETFL)?).contains(OFlag::O_PATH) {
+            return Err(io::Error::from_raw_os_error(libc::EBADF));
+        }
+        Self::from_dir_fd(fd)
+    }
+
+    /// `from_fd()` without the pre-checks, for fds we opened ourselves with
+    /// `O_DIRECTORY` and without `O_PATH`, which `fdopendir` cannot reject.
+    fn from_dir_fd(fd: OwnedFd) -> io::Result<Self> {
         Ok(Self {
             inner: Dir::from_fd(fd)?,
             state: DirectoryState::default(),
