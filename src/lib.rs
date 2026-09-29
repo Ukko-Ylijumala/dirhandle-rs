@@ -1,5 +1,9 @@
 // Copyright (c) 2024-2026 Mikko Tanner. All rights reserved.
 
+// nix types are part of the public API (`Entry`, `Type`, `Iter`, `Errno`), so
+// re-export the crate: downstream can name them without a version-matched dep
+pub use nix;
+
 use custom_xxh3::{CustomXxh3Hasher, Xxh3Hashable};
 use dashmap::{mapref::one::RefMut, DashMap};
 use enhvec::{EnhVec, Sorting};
@@ -81,7 +85,8 @@ followed by the inline `getdents` buffer of `st_blksize` bytes, clamped to
 up to its 128 KiB recordsize and varies it between directories, NFS often
 reports 1 MiB - so each handle records its own, see `dir_stream_heap()`.
 `nix::dir::Dir` itself is only the `DIR*` and lives inline in [DirHandle];
-the `dirent` that `readdir_r` fills is stack-allocated per call, not heap.
+`readdir` returns records inside that buffer, and the short-lived `CString`
+name of each nix `Entry` is freed again once `EntryExt::new` has copied it.
 */
 #[cfg(feature = "size_of")]
 const DIR_STREAM_HEADER:  usize = 48;
@@ -376,11 +381,12 @@ impl EntryName {
 /**
 A directory entry, aiming to be closely compatible with the
 [std::fs::DirEntry] API. Built from a [nix::dir::Entry] but does **not**
-keep one: the 280-byte `dirent` (256 of them the `d_name` array) is reduced
-to an owned name, the inode and `d_type` at construction, which makes an
-entry ~80 bytes instead of ~440 and keeps the lookahead buffer, `Vec`
-sorts and the `Peekable` slot cheap to move through. `file_name()`,
-`ino()` and `d_type()` cover what the old `Deref<Target = Entry>` exposed.
+keep one: the name (inline when short), the inode and `d_type` are copied
+out at construction. That keeps an entry at ~80 bytes (v0.4 carried the
+whole 280-byte `dirent`, ~440 bytes in all) and short names off the heap,
+so the lookahead buffer, `Vec` sorts and the `Peekable` slot stay cheap to
+move through. `file_name()`, `ino()` and `d_type()` cover what the old
+`Deref<Target = Entry>` exposed.
 
 Notable differences to `std`:
 - `metadata()` is replaced with `stat()`, and we return a [libc::stat] struct
@@ -692,13 +698,13 @@ impl<'h> EntryExt<'h> {
 
 /**
 NOTE: equality is defined over `(name, inode, parent dirfd)` - explicit
-fields only. Historical note: this must never go back to comparing raw
-`nix::dir::Entry`s: nix fills the dirent from `readdir_r` into a
-`MaybeUninit` buffer and only `d_reclen` bytes get copied, while libc's
-derived comparison reads the full 256-byte `d_name` array (plus
-`d_off`/`d_reclen`) - i.e. uninitialized garbage. The same logical entry
-read twice could compare unequal. Copying the fields out in `new()` is
-what makes `EntryExt` immune to that.
+fields only. Historical note: up to nix 0.30, `nix::dir::Entry` wrapped
+the raw dirent that `readdir_r` filled into a `MaybeUninit` buffer (only
+`d_reclen` bytes initialized), while libc's derived comparison read the
+full 256-byte `d_name` array (plus `d_off`/`d_reclen`) - i.e.
+uninitialized garbage, so the same logical entry read twice could compare
+unequal. nix 0.31's `Entry` owns plain fields, but copying ours out in
+`new()` keeps `EntryExt` independent of how nix represents an entry.
 */
 impl<'h> PartialEq for EntryExt<'h> {
     fn eq(&self, other: &Self) -> bool {
@@ -1511,9 +1517,7 @@ impl<'handle> DirHandleIter<'handle> {
     type not always being known ([libc::dirent::d_type] may be `DT_UNKNOWN`).
     */
     fn is_next_dir(&mut self) -> Option<bool> {
-        // `Result<Entry, _>` is `Copy`, so matching on the peeked value by
-        // value would memcpy the 280-byte dirent out of the slot each time;
-        // `as_ref()` keeps it a borrow
+        // `as_ref()`: the arms bind borrows of the peeked entry, no copies
         match self.inner.peek().map(Result::as_ref) {
             Some(Ok(e)) => {
                 /*

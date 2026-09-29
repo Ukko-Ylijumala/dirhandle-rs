@@ -4,7 +4,7 @@
 
 ## Compact layout (v0.5.0)
 
-The `Entry` is **not** retained. A `dirent` is 280 bytes, 256 of them the `d_name` array, and the old `EntryExt` (dirent + `BorrowedFd` + inline `OnceLock<Option<libc::stat>>`) weighed about 440 bytes — every lookahead push/pop, `Peekable` slot and sort comparison moved that much. `EntryExt::new` now copies out just what is needed:
+The `Entry` is **not** retained. Up to nix 0.30 an `Entry` was the raw 280-byte `dirent`, 256 bytes of it the `d_name` array, and the old `EntryExt` (dirent + `BorrowedFd` + inline `OnceLock<Option<libc::stat>>`) weighed about 440 bytes — every lookahead push/pop, `Peekable` slot and sort comparison moved that much. (nix 0.31's `Entry` is small but heap-allocates its name as a `CString`.) `EntryExt::new` copies out just what is needed:
 
 | Field    | Type                                  | Notes |
 | -------- | ------------------------------------- | ----- |
@@ -51,7 +51,7 @@ Beyond `len()`/`mode()`, the cached stat also feeds `is_empty()`, `uid()`, `gid(
 
 ## Equality, ordering, hashing
 
-`Eq`, `Ord` and `Hash` are all defined over explicit field tuples. Historical note, in case anyone is tempted to store the `Entry` again: nix fills the dirent from `readdir_r` into a `MaybeUninit` buffer and only `d_reclen` bytes are copied, while the libc derives compare/hash the entire struct including `d_off`, `d_reclen` and the uninitialized tail of the 256-byte `d_name` array. Delegating to those would make the same logical entry compare unequal (and hash differently) between two reads within one process. Copying the fields out in `new()` is what makes the current design immune.
+`Eq`, `Ord` and `Hash` are all defined over explicit field tuples. Historical note, in case anyone is tempted to store the `Entry` again: up to nix 0.30, nix filled the dirent from `readdir_r` into a `MaybeUninit` buffer and only `d_reclen` bytes were copied, while the libc derives compare/hash the entire struct including `d_off`, `d_reclen` and the uninitialized tail of the 256-byte `d_name` array. Delegating to those made the same logical entry compare unequal (and hash differently) between two reads within one process. nix 0.31 replaced that representation, but copying the fields out in `new()` keeps the design independent of nix's.
 
 - `PartialEq`/`Eq` — `(name_bytes, ino, parent dirfd)`.
 - `Ord` — name first (unique within a directory, so sorting behaviour is name-order), with ino and dirfd as tie-breakers so that `cmp() == Equal ⇔ eq()`. Keep these two consistent; sorted-collection invariants depend on it.

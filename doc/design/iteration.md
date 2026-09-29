@@ -31,6 +31,8 @@ The result is a **heuristic preference**, not a guarantee. Some filesystems neve
 
 A `readdir` error terminates the pass. Errors must **not** be skipped-and-continued: a persistently failing stream (`ESTALE` on NFS, `EIO` on a dying disk) would otherwise spin the skip loop forever, one failing syscall per iteration. The free `next()` helper leaves the error **unconsumed** in the `Peekable` slot, making it sticky: `done()` treats a peeked `Err` as end-of-stream, and repeated calls return `None` from the cached peek without re-issuing syscalls. An error-terminated pass yields an incomplete listing, so `DirHandleIter` skips `DirectoryState` finalisation in that case (`when` stays `None`, a later clean pass computes it). `for_each` uses `map_while(Result::ok)` for the same stop-on-first-error behaviour.
 
+All of this depends on nix actually reporting the errors, which requires nix ≥ 0.31 (`readdir` plus an errno check). nix 0.30 used `readdir_r`, which returns its error number instead of `-1`, and nix only checked for `-1` — every `readdir` error surfaced as a clean end of stream, so partial listings were finalised as the directory's state. glibc's `readdir_r` also silently skipped names longer than 255 bytes (possible on CIFS, ntfs3 and FUSE), which `readdir` returns. The integration test `readdir_error_ends_pass_without_finalizing` provokes a real `getdents64` failure by `dup2`-ing a regular file over the stream's fd.
+
 ## Rewind semantics
 
 nix's `Iter` rewinds the underlying `Dir` (via `rewinddir`) in its `Drop` impl — unconditionally, whether the iterator was exhausted or dropped early. A partially-consumed `DirHandleIter` therefore does **not** leave the `Dir` mid-stream; the next `iter()` call always starts from the beginning.

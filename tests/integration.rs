@@ -226,6 +226,36 @@ fn iteration_basics() {
     assert_eq!(raw_count, 6, "4 entries + . + ..");
 }
 
+#[test]
+fn readdir_error_ends_pass_without_finalizing() {
+    /*
+    Regression: nix 0.30 drove readdir_r(3), which reports errors through
+    its return value, but nix only checked for -1 - so every readdir error
+    looked like a clean end of stream, and the partial (here: empty)
+    listing was finalized as the directory's state. Provoke a real
+    getdents64 failure (ENOTDIR) by swapping a regular file in under the
+    open DIR* stream.
+    */
+    let td = TestDir::new("readdir-error");
+    let file: PathBuf = td.file("f.txt", b"x");
+    td.subdir("sub");
+
+    let mut h = DirHandle::new(td.path()).unwrap();
+    let f = fs::File::open(&file).unwrap();
+    assert!(unsafe { libc::dup2(f.as_raw_fd(), h.as_raw_fd()) } >= 0, "dup2 failed");
+
+    let mut it = h.iter();
+    assert_eq!(it.by_ref().count(), 0);
+    assert_eq!(it.error().map(|e| e as i32), Some(libc::ENOTDIR), "error must surface");
+    drop(it);
+    assert_eq!(h.state(), &DirectoryState::default(), "a failed pass must not finalize");
+
+    let err = h.state_current().expect_err("a partial listing must not pass as state");
+    assert_eq!(err.raw_os_error(), Some(libc::ENOTDIR), "{err}");
+    assert!(h.state_changed().is_err());
+    assert_eq!(h.state(), &DirectoryState::default(), "baseline must stay untouched");
+}
+
 /* ############################ ENTRY IDENTITY ############################# */
 
 #[test]
