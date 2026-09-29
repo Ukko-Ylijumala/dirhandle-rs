@@ -23,11 +23,13 @@ The simplest discipline: drop or `close()` the current checkout before requestin
 
 ## Rc, not Arc
 
-`CheckedOutHandle::close_callback` is `Rc<dyn Fn(RawFd)>`. `Rc` is deliberate — it prevents the type from being `Send`, so a checked-out handle cannot be moved across threads. Even though the underlying `DirHandle` is `Send`, moving an active lock guard across threads would violate DashMap's locking model. Do not "fix" this to `Arc`.
+`CheckedOutHandle` carries a `PhantomData<Rc<()>>` marker. `Rc` is deliberate — it makes the type `!Send`, so a checked-out handle cannot be moved across threads. Even though the underlying `DirHandle` is `Send`, moving an active lock guard across threads would violate DashMap's locking model. Do not "fix" this to `Arc` or drop the marker; a `compile_fail` doc-test on the struct guards the property.
+
+Earlier versions got the same `!Send` effect from an `Rc<dyn Fn(RawFd)>` close callback, which cost a heap allocation and a vtable call per checkout. The handle now holds a plain `&OpenHandles` and calls `close(fd)` on it directly.
 
 ## Lifecycle
 
-`CheckedOutHandle::close(self)` explicitly drops the `RefMut` before invoking the close callback. This ordering matters: the callback calls `OpenHandles::close(fd)`, which itself acquires a write lock, so the existing `RefMut` must be released first or you hit the same deadlock pattern described above. The unlock-then-remove sequence opens a tiny fd-reuse window (another thread closes the fd, the kernel recycles the number for a fresh handle, and the remove evicts the newcomer) — inherent to keying the pool by `RawFd`.
+`CheckedOutHandle::close(self)` explicitly drops the `RefMut` before calling `OpenHandles::close(fd)` on the pool. This ordering matters: `close(fd)` acquires a write lock on the shard, so the existing `RefMut` must be released first or you hit the same deadlock pattern described above. The unlock-then-remove sequence opens a tiny fd-reuse window (another thread closes the fd, the kernel recycles the number for a fresh handle, and the remove evicts the newcomer) — inherent to keying the pool by `RawFd`.
 
 The map being keyed by `RawFd` also means the pool is sound only while each entry's fd number is owned by its `DirHandle`'s inner `Dir` — which `Dir` guarantees (it closes the fd only on drop, i.e. on removal from the map).
 

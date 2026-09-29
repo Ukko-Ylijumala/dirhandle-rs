@@ -15,11 +15,13 @@ On such `d_type`-less filesystems (some XFS configurations, NFS, FAT), note that
 
 There is also `entries(dirs, files)` / `entries_sorted()` for non-iterator access, returning `(EntryVec, EntryVec)` tuples.
 
+`entries()`, and therefore `iter_sorted()` / `entries_sorted()`, plus the internal `directory_state()` pass run `DirHandleIter` in **plain mode**: a straight pass with no lookahead buffer, since the result gets partitioned and usually sorted afterwards anyway. Plain mode keeps the `.`/`..` filtering, the sticky-error semantics and the lazy `DirectoryState` finalisation; only the dir-first reordering is skipped.
+
 ## Dir-first lookahead
 
 `DirHandleIter` keeps a `BufDeque<EntryExt>` with capacity `LOOKAHEAD_BUFFER_SIZE = 64`. `BufDeque::push` routes directory entries to the front and everything else to the back. On `next()`:
 
-1. If the buffer has any entry, `try_pop_dir` pops the first directory found, else the oldest entry.
+1. If the buffer has any entry, `try_pop_dir` pops the front entry. Buffered directories always form a prefix of the queue (`push` is the only way in), so when the dir counter is non-zero the front entry *is* the first directory — O(1), no scan. The pop also reports whether the entry is a directory, so `next()` never re-derives that.
 2. If the popped entry is a directory, return it.
 3. Otherwise, try to peek the next raw entry. If `dirent.d_type` says it's a directory, push the file back into the buffer and return the directory. If `d_type` is `DT_UNKNOWN`, fetch one more entry to find out — push whichever loses back into the buffer.
 

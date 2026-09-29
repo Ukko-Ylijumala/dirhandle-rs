@@ -324,7 +324,7 @@ long as the entry exists, which the borrow checker enforces. Collecting
 entries into a `Vec` keeps the handle borrowed for the lifetime of the
 vec, so use-after-close zombies are not constructible from safe code.
 */
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct EntryExt<'h> {
     entry: Entry,
     dirfd: BorrowedFd<'h>,
@@ -333,9 +333,28 @@ pub struct EntryExt<'h> {
 
 impl<'h> Eq for EntryExt<'h> {}
 
+/**
+Hand-written so that logging an entry prints its name, inode and type
+instead of nix's derived output, which dumps the whole 280-byte dirent
+including all 256 bytes of `d_name` - unusable and expensive at trace
+level, where this is formatted once per entry.
+*/
+impl<'h> Debug for EntryExt<'h> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct("EntryExt")
+            .field("name", &self.file_name())
+            .field("ino", &self.ino())
+            .field("d_type", &self.entry.file_type())
+            .field("dirfd", &self.dirfd.as_raw_fd())
+            // None: not statted yet; Some(false): stat() failed
+            .field("statted", &self.stat.get().map(Option::is_some))
+            .finish()
+    }
+}
+
 impl<'h> EntryExt<'h> {
     /// Create an `EntryExt` from a given [Entry] and its parent directory fd.
-    #[instrument(level = "trace")]
+    #[instrument(level = "trace", skip(entry), fields(name = ?entry.file_name()))]
     pub fn new(entry: Entry, dirfd: BorrowedFd<'h>) -> Self {
         Self {
             entry,
@@ -1029,7 +1048,9 @@ impl DirHandle {
     ) -> (EntryVec<'handle>, EntryVec<'handle>) {
         let mut d_vec: EntryVec<'handle> = EnhVec::new();
         let mut f_vec: EntryVec<'handle> = EnhVec::new();
-        self.iter().for_each(|entry: EntryExt<'handle>| {
+        // everything gets partitioned (and usually sorted) afterwards, so
+        // the dir-first lookahead of `iter()` would be wasted work here
+        DirHandleIter::new(self, false).plain().for_each(|entry: EntryExt<'handle>| {
             match entry.file_type() {
                 Some(Type::Directory) => {
                     if dirs {
@@ -1163,25 +1184,24 @@ impl<'h> BufDeque<EntryExt<'h>> {
     }
 
     /**
-    Try to pop a directory entry. The first directory found is chosen,
-    but if none are in the buffer, we pop the oldest (front) entry.
+    Pop the next entry, preferring directories. Since `push` is the only
+    way in and it puts directories at the front and everything else at the
+    back, the buffered directories always form a prefix of the queue - so
+    "the first directory" is simply the front entry whenever `n_dirs > 0`,
+    and no scan is needed. With no directories buffered, the oldest entry
+    is popped instead.
+
+    The returned flag says whether the popped entry is a directory, so the
+    caller does not have to re-derive it via `is_dir()`.
     */
-    pub fn try_pop_dir(&mut self) -> Option<EntryExt<'h>> {
-        if self.n_dirs == 0 {
-            return self.q.pop_front();
+    pub fn try_pop_dir(&mut self) -> Option<(EntryExt<'h>, bool)> {
+        let entry: EntryExt<'h> = self.q.pop_front()?;
+        if self.n_dirs > 0 {
+            debug_assert!(entry.is_dir(), "n_dirs > 0 but the front entry is not a directory");
+            self.n_dirs -= 1;
+            return Some((entry, true));
         }
-        match self.q.iter().position(|entry: &EntryExt<'h>| entry.is_dir()) {
-            // directories are pushed to the front, so idx is almost always 0
-            Some(idx) => {
-                self.n_dirs -= 1;
-                self.q.remove(idx)
-            }
-            None => {
-                // fail-safe: counter desynced (should not be possible)
-                self.n_dirs = 0;
-                self.q.pop_front()
-            }
-        }
+        Some((entry, false))
     }
 }
 
@@ -1213,6 +1233,13 @@ pub struct DirHandleIter<'handle> {
     stat: bool,
     /// shall we finalize the [DirectoryState] when the pass completes?
     update: bool,
+    /**
+    Plain mode: a straight pass over the stream without the dir-first
+    lookahead buffer. Used by `entries()` / `directory_state()`, which
+    partition or hash everything afterwards and gain nothing from the
+    ordering heuristic. State tracking works exactly as in buffered mode.
+    */
+    plain: bool,
     /// per-entry xxh3 digests of dir entries - used for state hashing
     dirs: Vec<u64>,
     /// per-entry xxh3 digests of file entries - used for state hashing
@@ -1253,10 +1280,17 @@ impl<'handle> DirHandleIter<'handle> {
             state: &mut handle.state,
             stat,
             update,
+            plain: false,
             dirs: Vec::new(),
             files: Vec::new(),
             started: TimeSinceEpoch::new(),
         }
+    }
+
+    /// Switch this iterator to plain mode (see the `plain` field).
+    fn plain(mut self) -> Self {
+        self.plain = true;
+        self
     }
 
     /// Is the inner iterator done? A sticky `readdir` error (see [next])
@@ -1287,8 +1321,11 @@ impl<'handle> DirHandleIter<'handle> {
     type not always being known ([libc::dirent::d_type] may be `DT_UNKNOWN`).
     */
     fn is_next_dir(&mut self) -> Option<bool> {
-        self.inner.peek().map_or(Some(false), |res| {
-            res.map_or(Some(false), |e: Entry| {
+        // `Result<Entry, _>` is `Copy`, so matching on the peeked value by
+        // value would memcpy the 280-byte dirent out of the slot each time;
+        // `as_ref()` keeps it a borrow
+        match self.inner.peek().map(Result::as_ref) {
+            Some(Ok(e)) => {
                 /*
                 `.` and `..` are both directories, but `get_one()` filters
                 them out - treating them as "next dir" here would wrongly
@@ -1297,10 +1334,40 @@ impl<'handle> DirHandleIter<'handle> {
                 if matches!(e.file_name().to_bytes(), DOT1 | DOT2) {
                     return Some(false);
                 }
-                e.file_type()
-                    .map_or(None, |t: Type| Some(t == Type::Directory))
-            })
-        })
+                e.file_type().map(|t: Type| t == Type::Directory)
+            }
+            _ => Some(false),
+        }
+    }
+
+    /**
+    The inner iterator is exhausted or has hit a sticky error: finalize
+    the [DirectoryState] if this pass was clean, complete and asked for
+    it. Safe to call repeatedly; only the first call after a clean pass
+    does any work.
+    */
+    fn finish(&mut self) {
+        debug!(target: "DirHandleIter::next", "iter_done: {:?}", self.inner);
+        if self.errored() {
+            /*
+            the listing is incomplete, so we must not finalize the
+            DirectoryState from partial data; `when` stays as-is and
+            a later full pass will compute the state instead.
+            */
+            warn!(target: "DirHandleIter::next",
+                "readdir error ended iteration early (listing incomplete): {:?}",
+                self.inner.peek());
+            return;
+        }
+        if self.update {
+            self.update = false;
+            self.state.dirs = self.dirs.len();
+            self.state.files = self.files.len();
+            self.state.hash_d = digest_of_digests(mem::take(&mut self.dirs));
+            self.state.hash_f = digest_of_digests(mem::take(&mut self.files));
+            self.state.when = self.started.clone().into();
+            trace!(target: "DirHandle.state", "{:?}", self.state);
+        }
     }
 
     /// Get one entry from the inner iterator.
@@ -1345,9 +1412,19 @@ impl<'handle> Iterator for DirHandleIter<'handle> {
     type Item = EntryExt<'handle>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        if self.plain {
+            // straight pass: no lookahead, no reordering
+            return match self.get_one() {
+                Some(entry) => Some(entry),
+                None => {
+                    self.finish();
+                    None
+                }
+            };
+        }
         loop {
-            if let Some(entry) = self.buf.try_pop_dir() {
-                if entry.is_dir() {
+            if let Some((entry, is_dir)) = self.buf.try_pop_dir() {
+                if is_dir {
                     return Some(entry);
                 } else {
                     match self.done() {
@@ -1389,27 +1466,7 @@ impl<'handle> Iterator for DirHandleIter<'handle> {
                     }
                 }
             } else if self.done() {
-                debug!(target: "DirHandleIter::next", "iter_done: {:?}", self.inner);
-                if self.errored() {
-                    /*
-                    the listing is incomplete, so we must not finalize the
-                    DirectoryState from partial data; `when` stays as-is and
-                    a later full pass will compute the state instead.
-                    */
-                    warn!(target: "DirHandleIter::next",
-                        "readdir error ended iteration early (listing incomplete): {:?}",
-                        self.inner.peek());
-                    return None;
-                }
-                if self.update {
-                    self.update = false;
-                    self.state.dirs = self.dirs.len();
-                    self.state.files = self.files.len();
-                    self.state.hash_d = digest_of_digests(mem::take(&mut self.dirs));
-                    self.state.hash_f = digest_of_digests(mem::take(&mut self.files));
-                    self.state.when = self.started.clone().into();
-                    trace!(target: "DirHandle.state", "{:?}", self.state);
-                }
+                self.finish();
                 return None;
             } else if self.buf.is_empty() {
                 self.fill_buffer();
@@ -1483,9 +1540,8 @@ impl OpenHandles {
     fn wrap<'a>(&'a self, ref_handle: RefMut<'a, RawFd, DirHandle>) -> CheckedOutHandle<'a> {
         CheckedOutHandle {
             inner: ref_handle,
-            close_callback: Rc::new(|fd: i32| {
-                self.close(fd);
-            }),
+            pool: self,
+            _not_send: PhantomData,
         }
     }
 
@@ -1621,15 +1677,31 @@ An exclusively locked [DirHandle] from the [OpenHandles] container.
 as a `DirHandle` directly. In addition, it has a `close()` method which
 removes the `DirHandle` from parent `OpenHandles` (hence the directory
 handle is closed and its file descriptor released when dropped).
+
+A checked-out handle is an active DashMap shard lock and must stay on
+the thread that took it, so the type is deliberately `!Send`:
+
+```compile_fail
+use dirhandle::OpenHandles;
+fn assert_send<T: Send>(_: &T) {}
+let pool = OpenHandles::new();
+let h = pool.open(std::path::Path::new("/")).unwrap();
+assert_send(&h); // error: `Rc<()>` cannot be sent between threads safely
+```
 */
 pub struct CheckedOutHandle<'a> {
     inner: RefMut<'a, RawFd, DirHandle>,
+    /// the pool this handle was checked out from - `close()` removes it there
+    pool: &'a OpenHandles,
     /*
-    Using `Rc` instead of `Arc` here is deliberate because we don't want to
-    share the callback between threads and this also disallows moving a
-    checked-out handle to another thread.
+    Marker that makes the type `!Send` (and `!Sync`). Earlier versions got
+    the same effect from an `Rc<dyn Fn(RawFd)>` close callback, which cost
+    a heap allocation and a vtable call per checkout; a zero-sized `Rc`
+    phantom keeps the property for free. Do not "fix" this to `Arc` or
+    remove it - moving a live lock guard across threads violates DashMap's
+    locking model (see doc/design/open-handles.md).
     */
-    close_callback: Rc<dyn Fn(RawFd) + 'a>,
+    _not_send: PhantomData<Rc<()>>,
 }
 
 impl<'a> CheckedOutHandle<'a> {
@@ -1644,9 +1716,10 @@ impl<'a> CheckedOutHandle<'a> {
     on `OpenHandles::open`.
     */
     pub fn close(self) {
-        let fd: i32 = *self.inner.key();
-        drop(self.inner); // explicitly drop the RefMut
-        (self.close_callback)(fd);
+        let fd: RawFd = *self.inner.key();
+        let pool: &'a OpenHandles = self.pool;
+        drop(self.inner); // explicitly release the RefMut before touching the map
+        pool.close(fd);
     }
 }
 
@@ -1751,7 +1824,7 @@ fn directory_state(dir: &mut DirHandle) -> io::Result<DirectoryState> {
     let started: TimeSinceEpoch = TimeSinceEpoch::new();
     let mut d_digests: Vec<u64> = Vec::new();
     let mut f_digests: Vec<u64> = Vec::new();
-    let mut iter: DirHandleIter = DirHandleIter::with_update(dir, false, false);
+    let mut iter: DirHandleIter = DirHandleIter::with_update(dir, false, false).plain();
     for entry in iter.by_ref() {
         match entry.file_type() {
             Some(Type::Directory) => d_digests.push(entry.xxh3_digest()),
