@@ -137,4 +137,5 @@ Contributions are welcome, but please note that the API is still in flux. Openin
 - `0.4.2` — unit and integration test harnesses.
 - `0.4.3` — fixes: `DirectoryState.when` stamped at pass start (mid-pass changes could otherwise evade `state_changed_fast()` permanently), atomic insert+checkout in `OpenHandles::open`, `size_of` accounting. Perf: plain iteration mode for `entries()`/`iter_sorted()`, O(1) lookahead pop, allocation-free `CheckedOutHandle`.
 - `0.5.0` — **breaking**: compact `EntryExt` (≤ 80 bytes, no `Deref<Target = Entry>`; `file_name()`/`ino()`/`d_type()` are inherent, `new()` takes `&Entry`). **Digest scheme change**: commutative fold instead of sort-then-hash, `typenum()` yields kernel `DT_*` values.
-- `0.5.1` — current. README refresh, `d_type` fallback test, clippy sweep, `EntryExt::open()` without `unsafe`.
+- `0.5.1` — README refresh, `d_type` fallback test, clippy sweep, `EntryExt::open()` without `unsafe`.
+- `0.5.2` — current. `DirHandle::path()` / `DirFd::path()` / `EntryExt::path()` fail with `NotFound` once the directory has been deleted, instead of returning procfs's `"<path> (deleted)"` string.

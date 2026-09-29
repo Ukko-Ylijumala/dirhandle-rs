@@ -209,6 +209,7 @@ impl DirFd {
     - stale file descriptor
     - procfs not available
     - file descriptor not found in procfs
+    - the directory has been deleted (`NotFound`; see [proc_fd_path])
     */
     pub fn path(&self) -> io::Result<PathBuf> {
         let fd: RawFd = self.fd();
@@ -218,7 +219,8 @@ impl DirFd {
         if fd < 0 {
             return Err(io::Error::new(io::ErrorKind::NotFound, "stale file descriptor"));
         }
-        proc_fd_path(fd)
+        // `fd >= 0` was checked above, so `as_fd()` cannot panic here
+        proc_fd_path(self)
     }
 }
 
@@ -608,9 +610,10 @@ impl<'h> EntryExt<'h> {
 
     The entry name is joined as raw bytes ([OsStr]), so non-UTF-8 file
     names resolve to their real paths instead of a lossy approximation.
+    Fails with `NotFound` if the parent directory has been deleted.
     */
     pub fn path(&self) -> io::Result<PathBuf> {
-        let link: PathBuf = proc_fd_path(self.dirfd.as_raw_fd())?;
+        let link: PathBuf = proc_fd_path(self.dirfd)?;
         Ok(link.join(OsStr::from_bytes(self.name_as_bytes())))
     }
 
@@ -954,10 +957,12 @@ impl DirHandle {
 
     /**
     This relies on proc filesystem being available due to the use of
-    `/proc/self/fd` to resolve the path by file descriptor.
+    `/proc/self/fd` to resolve the path by file descriptor. Fails with
+    `NotFound` once the directory has been deleted (`rmdir`), even though
+    the handle itself stays open and iterable (as empty).
     */
     pub fn path(&self) -> io::Result<PathBuf> {
-        self.fd().path()
+        proc_fd_path(&self.inner)
     }
 
     /// Stored state of the directory as a [DirectoryState] object.
@@ -1813,21 +1818,35 @@ impl Debug for CheckedOutHandle<'_> {
 /* ########################### UTILITY FUNCTIONS ########################### */
 
 /**
-Resolve an open file descriptor to its path via `/proc/self/fd/<fd>`.
+Resolve an open directory file descriptor to its path via
+`/proc/self/fd/<fd>`.
 
 NOTE: `/proc/self/fd` is itself a directory (its *entries* are symlinks),
 so probing procfs availability must not `readlink()` the directory - that
 fails with EINVAL even when procfs is mounted. We attempt the per-fd
 resolution directly and only diagnose a missing procfs after a failure.
+
+A directory that has been deleted while we hold it open still resolves
+in procfs, to `"<old path> (deleted)"` - a path that does not exist and
+that a caller would happily join entry names onto. We detect that case
+by link count instead of by string: `rmdir` drops the inode's `st_nlink`
+to 0, which `fstat` on the open fd reports, whereas a directory that is
+merely *named* `"foo (deleted)"` keeps its links. Deleted directories
+therefore fail with `NotFound`.
 */
-fn proc_fd_path(fd: RawFd) -> io::Result<PathBuf> {
-    read_link(format!("{}/{}", PROC_FD_PATH, fd)).map_err(|e| {
+fn proc_fd_path<Fd: AsFd>(fd: Fd) -> io::Result<PathBuf> {
+    let raw: RawFd = fd.as_fd().as_raw_fd();
+    let link: PathBuf = read_link(format!("{}/{}", PROC_FD_PATH, raw)).map_err(|e| {
         if e.kind() == io::ErrorKind::NotFound && !Path::new(PROC_FD_PATH).is_dir() {
             io::Error::new(io::ErrorKind::Unsupported, "procfs not available")
         } else {
             e
         }
-    })
+    })?;
+    if fstat(&fd)?.st_nlink == 0 {
+        return Err(io::Error::new(io::ErrorKind::NotFound, "directory has been deleted"));
+    }
+    Ok(link)
 }
 
 /**

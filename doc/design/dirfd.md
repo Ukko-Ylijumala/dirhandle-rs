@@ -28,6 +28,8 @@ Both `set()` and `clear()` use `AtomicI32::fetch_update`, so the check-and-store
 
 `path()` resolves the fd back to a filesystem path by reading `/proc/self/fd/<fd>`. This is a hard dependency on Linux procfs being mounted; on systems where it isn't, `path()` returns `io::ErrorKind::Unsupported`. Stale/uninitialized fds return `NotFound` without touching procfs.
 
+A directory deleted while the fd is open still resolves in procfs, to `"<old path> (deleted)"`. `proc_fd_path()` refuses to hand that out: after a successful `readlink` it `fstat`s the fd and fails with `NotFound` when `st_nlink == 0`, which is what `rmdir` leaves behind on the inode. The link count is used rather than the string suffix so that a directory merely *named* `"something (deleted)"` still resolves. `DirHandle::path()` and `EntryExt::path()` share the same helper (they pass their own `AsFd`, skipping the `DirFd` detour), so all three entry points agree.
+
 Availability is diagnosed *after* the fact, not probed up front: `/proc/self/fd` is itself a directory (its entries are the symlinks), so `readlink()` on it fails with `EINVAL` even when procfs is mounted — a pre-check built on that call would report procfs as missing unconditionally. Instead, `proc_fd_path()` attempts the per-fd `readlink` directly and only maps the error to `Unsupported` when the failure is `NotFound` *and* `/proc/self/fd` does not exist as a directory.
 
 ## Thread-safety and `AsFd`

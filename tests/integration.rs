@@ -116,6 +116,25 @@ fn non_utf8_names_round_trip() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+#[test]
+fn path_of_deleted_directory_is_not_found() {
+    let td = TestDir::new("deleted-path");
+    let sub: PathBuf = td.subdir("gone");
+    let mut h = DirHandle::new(&sub).unwrap();
+    assert_eq!(h.path().unwrap(), sub.canonicalize().unwrap());
+
+    fs::remove_dir(&sub).unwrap();
+    // the handle stays open and iterates as empty ...
+    assert_eq!(h.iter().count(), 0);
+    // ... but procfs would now resolve it to "<path> (deleted)", which must
+    // not leak out as a path; both resolution entry points agree
+    for res in [h.path(), h.fd().path()] {
+        let err = res.expect_err("deleted directory must not resolve to a path");
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound, "{err}");
+        assert!(!err.to_string().contains("(deleted)"), "procfs artefact leaked: {err}");
+    }
+}
+
 /* ############################## OPEN FLAGS ############################### */
 
 #[test]
