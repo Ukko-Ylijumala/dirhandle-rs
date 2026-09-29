@@ -30,7 +30,7 @@ The interesting design decisions are split out under `doc/design/`. Read the rel
 
 ## Editing pitfalls
 
-- The `SizeOf` impls hard-code `DIR_STREAM_HEAP` (32 KiB + header) as the per-handle heap cost: glibc's `opendir`/`fdopendir` allocate a `struct __dirstream` with an inline `getdents` buffer of `max(st_blksize, 32 KiB)`. Re-verify if glibc's `sysdeps/posix/opendir.c` changes.
+- The `SizeOf` impl charges each handle its glibc directory stream: `DIR_STREAM_HEADER` plus the inline `getdents` buffer that `opendir`/`fdopendir` size as `st_blksize` clamped to `DIR_STREAM_BUF_MIN..=DIR_STREAM_BUF_MAX` (32 KiB .. 1 MiB). `st_blksize` is not a per-filesystem constant (ZFS: up to 128 KiB and varying per directory; NFS: often 1 MiB), so `DirHandle::from_dir()` records it with one `fstat` at open, gated on the feature. Every constructor must go through `from_dir()`. Re-verify if glibc's `sysdeps/posix/opendir.c` changes.
 - `EntryExt::typenum()` uses the pinned `TYPENUM_*` constants (kernel `DT_*` values), never `Type as u8`: the values are part of the stable `DirectoryState` digests. The digest scheme itself lives in `DigestFold`; changing either breaks hash compatibility and needs a version note in `doc/design/state-tracking.md`.
 - `tracing` is used with explicit `target = "..."` strings throughout. Preserve targets when adding or moving log statements so downstream filters keep working.
 - nix's `Iter` rewinds the underlying `Dir` on drop (early or exhausted), so a partially-consumed `DirHandleIter` never leaves the `Dir` mid-stream. `DirectoryState` finalisation is stricter: it only happens on a clean, complete pass — early drops and `readdir` errors skip the state update.

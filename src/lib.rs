@@ -74,13 +74,19 @@ const NAME_INLINE_CAP: usize = 39;
 Heap footprint of one open directory stream as allocated by glibc's
 `opendir` / `fdopendir` (`sysdeps/posix/opendir.c`): a `struct __dirstream`
 header (fd, lock, allocation / size / offset bookkeeping, ~48 bytes)
-followed by the inline `getdents` buffer, which is `max(st_blksize, 32 KiB)`
-capped at 1 MiB. 32 KiB covers every common filesystem. `nix::dir::Dir`
-itself is only the `DIR*` and lives inline in [DirHandle]; the `dirent`
-that `readdir_r` fills is stack-allocated per call, not heap.
+followed by the inline `getdents` buffer of `st_blksize` bytes, clamped to
+32 KiB .. 1 MiB. That size is not a per-filesystem constant - ZFS reports
+up to its 128 KiB recordsize and varies it between directories, NFS often
+reports 1 MiB - so each handle records its own, see `dir_stream_heap()`.
+`nix::dir::Dir` itself is only the `DIR*` and lives inline in [DirHandle];
+the `dirent` that `readdir_r` fills is stack-allocated per call, not heap.
 */
 #[cfg(feature = "size_of")]
-const DIR_STREAM_HEAP: usize = 32 * 1024 + 48;
+const DIR_STREAM_HEADER:  usize = 48;
+#[cfg(feature = "size_of")]
+const DIR_STREAM_BUF_MIN: usize = 32 * 1024;
+#[cfg(feature = "size_of")]
+const DIR_STREAM_BUF_MAX: usize = 1024 * 1024;
 
 /**
 Since we cannot import [std::sys] directly (it's private), we need to
@@ -925,16 +931,16 @@ unsafe to call `readdir` simultaneously from multiple threads.
 pub struct DirHandle {
     inner: Dir,
     state: DirectoryState,
+    /// heap bytes of glibc's DIR stream, sized at open (see `dir_stream_heap()`)
+    #[cfg(feature = "size_of")]
+    stream_heap: usize,
 }
 
 impl DirHandle {
     /// Open a directory by path and return its handle object.
     #[instrument(level = "trace")]
     pub fn new(path: &Path) -> io::Result<Self> {
-        Ok(Self {
-            inner: get_dir_handle(path)?,
-            state: DirectoryState::default(),
-        })
+        Ok(Self::from_dir(get_dir_handle(path)?))
     }
 
     /**
@@ -963,10 +969,17 @@ impl DirHandle {
     /// `from_fd()` without the pre-checks, for fds we opened ourselves with
     /// `O_DIRECTORY` and without `O_PATH`, which `fdopendir` cannot reject.
     fn from_dir_fd(fd: OwnedFd) -> io::Result<Self> {
-        Ok(Self {
-            inner: Dir::from_fd(fd)?,
+        Ok(Self::from_dir(Dir::from_fd(fd)?))
+    }
+
+    /// Wrap a freshly opened [Dir]; every constructor ends up here.
+    fn from_dir(inner: Dir) -> Self {
+        Self {
+            #[cfg(feature = "size_of")]
+            stream_heap: dir_stream_heap(&inner),
+            inner,
             state: DirectoryState::default(),
-        })
+        }
     }
 
     /// Our file descriptor as a [DirFd] object.
@@ -1223,10 +1236,12 @@ const _: () = {
 #[cfg(feature = "size_of")]
 impl SizeOf for DirHandle {
     fn size_of_children(&self, context: &mut Context) {
-        // the only heap child is glibc's directory stream; our own fields
-        // (the `DIR*` and the DirectoryState) are inline and counted by
-        // the caller via `size_of::<DirHandle>()`
-        context.add(DIR_STREAM_HEAP).add_distinct_allocation();
+        /*
+        the only heap child is glibc's directory stream, sized at open; our
+        own fields (the `DIR*` and the DirectoryState) are inline and counted
+        by the caller via `size_of::<DirHandle>()`
+        */
+        context.add(self.stream_heap).add_distinct_allocation();
     }
 }
 
@@ -1891,6 +1906,21 @@ fn get_dir_handle(path: &Path) -> io::Result<Dir> {
     Ok(Dir::open(path, flags, Mode::empty())?)
 }
 
+/**
+Heap footprint of glibc's stream for a just-opened directory: the header
+plus the `getdents` buffer, which `opendir` / `fdopendir` size from the
+directory's `st_blksize`. Called right after the open, so our `fstat`
+sees what glibc's own one did. Falls back to the 32 KiB minimum if the
+`fstat` fails.
+*/
+#[cfg(feature = "size_of")]
+fn dir_stream_heap(dir: &Dir) -> usize {
+    let buf: usize = fstat(dir).map_or(DIR_STREAM_BUF_MIN, |st: libc::stat| {
+        (st.st_blksize as usize).clamp(DIR_STREAM_BUF_MIN, DIR_STREAM_BUF_MAX)
+    });
+    DIR_STREAM_HEADER + buf
+}
+
 /// Open a file and return its handle.
 #[expect(dead_code)]
 fn get_file_handle(path: &Path) -> io::Result<File> {
@@ -2226,6 +2256,20 @@ mod tests {
 
         drop(h);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(feature = "size_of")]
+    #[test]
+    fn size_of_counts_the_actual_dir_stream_buffer() {
+        // glibc sizes the buffer from st_blksize, clamped to 32 KiB .. 1 MiB
+        for dir in [std::env::temp_dir(), PathBuf::from("/dev/shm")] {
+            let Ok(h) = DirHandle::new(&dir) else { continue };
+            let blksize: usize = h.stat().unwrap().st_blksize as usize;
+            let buf: usize = blksize.clamp(DIR_STREAM_BUF_MIN, DIR_STREAM_BUF_MAX);
+            let total = h.size_of();
+            assert_eq!(total.total_bytes(), size_of::<DirHandle>() + DIR_STREAM_HEADER + buf, "{dir:?}");
+            assert_eq!(total.distinct_allocations(), 1);
+        }
     }
 
     #[test]
