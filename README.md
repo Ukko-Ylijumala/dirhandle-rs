@@ -15,7 +15,7 @@
 
 ## Overview
 
-**DirHandle** is a Rust library for efficient directory traversal and change detection on Linux. It extends `nix::dir::Entry` with metadata caching, stable hashing, and prioritized iteration, and provides a thread-safe pool for managing many open directory handles at once.
+**DirHandle** is a Rust library for efficient directory traversal and change detection on Linux. It wraps `nix::dir` entries in a compact type with metadata caching, stable hashing, and prioritized iteration, and provides a thread-safe pool for managing many open directory handles at once.
 
 ## Features
 

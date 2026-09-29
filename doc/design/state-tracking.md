@@ -43,9 +43,12 @@ Because the comparison short-circuits, a `DirNum`/`FileNum` result also implies 
 
 ## Hash stability
 
-Each entry contributes its per-entry `xxh3_digest()` (a `u64` over `(name_bytes, ino, typenum)`, explicitly **not** the dirfd — see [entry-ext.md](entry-ext.md); `typenum` is the pinned `TYPENUM_*` constant, not nix's enum discriminant, so an upstream reorder cannot change the digests); the digests are then **sorted** and fed into one final hasher by `digest_of_digests()`. Sorting makes the result independent of `readdir` order, and accumulating 8 bytes per entry (rather than cloning every `EntryExt` until the pass completes, as earlier versions did) keeps memory flat for huge directories. `digest_of_digests()` is the single source of truth — both the lazy in-iterator finalisation and `directory_state()` go through it, so the two paths always produce comparable values.
+Each entry contributes its per-entry `xxh3_digest()` (a `u64` over `(name_bytes, ino, typenum)`, explicitly **not** the dirfd — see [entry-ext.md](entry-ext.md); `typenum` is the kernel `DT_*` value via the pinned `TYPENUM_*` constants, not nix's enum discriminant, so an upstream reorder cannot change the digests). The digests are folded into a `DigestFold` as they stream past: a wrapping **sum**, an **xor** and the **count**, mixed through one xxh3 in `finish()`. Both folds are commutative, so the result is independent of `readdir` order, and the accumulator is O(1) memory and O(n) time per pass — no per-entry `Vec` and no `n log n` sort. Either fold alone would let trivially constructed multisets collide (`{a, b}` vs `{c, d}` with `a + b == c + d`); the pair requires simultaneous sum *and* xor equality, and the count separates e.g. `{}` from `{0}` or `{7, 7}`. It is a change-detection fingerprint, not a cryptographic commitment. `DigestFold` is the single source of truth — both the lazy in-iterator finalisation and `directory_state()` go through it, so the two paths always produce comparable values.
 
-A handle closed and reopened against the same directory produces identical hashes if the contents are unchanged. Note that the digest *scheme* changed in v0.4.0 (sorted per-entry digests instead of hashing name-sorted entries in sequence): hash values are stable going forward but do not match those produced by earlier versions.
+A handle closed and reopened against the same directory produces identical hashes if the contents are unchanged. The digest *scheme* has changed twice, so hash values are stable within a series but not across these boundaries:
+
+- **v0.4.0** — sorted per-entry digests instead of hashing name-sorted entries in sequence.
+- **v0.5.0** — commutative fold instead of sort-then-hash, and `typenum` switched from nix's enum order (0..6, unknown 254) to the kernel `DT_*` values.
 
 ## `hash_all()`
 

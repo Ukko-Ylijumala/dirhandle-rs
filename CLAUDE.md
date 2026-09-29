@@ -31,8 +31,8 @@ The interesting design decisions are split out under `doc/design/`. Read the rel
 ## Editing pitfalls
 
 - The `SizeOf` impls hard-code `DIR_STREAM_HEAP` (32 KiB + header) as the per-handle heap cost: glibc's `opendir`/`fdopendir` allocate a `struct __dirstream` with an inline `getdents` buffer of `max(st_blksize, 32 KiB)`. Re-verify if glibc's `sysdeps/posix/opendir.c` changes.
-- `EntryExt::typenum()` uses the pinned `TYPENUM_*` constants, never `Type as u8`: the values are part of the stable `DirectoryState` digests.
+- `EntryExt::typenum()` uses the pinned `TYPENUM_*` constants (kernel `DT_*` values), never `Type as u8`: the values are part of the stable `DirectoryState` digests. The digest scheme itself lives in `DigestFold`; changing either breaks hash compatibility and needs a version note in `doc/design/state-tracking.md`.
 - `tracing` is used with explicit `target = "..."` strings throughout. Preserve targets when adding or moving log statements so downstream filters keep working.
 - nix's `Iter` rewinds the underlying `Dir` on drop (early or exhausted), so a partially-consumed `DirHandleIter` never leaves the `Dir` mid-stream. `DirectoryState` finalisation is stricter: it only happens on a clean, complete pass — early drops and `readdir` errors skip the state update.
-- Never delegate `EntryExt`'s `Hash`/`PartialEq` back to `nix::dir::Entry`'s derived impls: nix only initialises `d_reclen` bytes of the dirent, while the libc derives read the full struct including uninitialized `d_name` tail bytes.
+- `EntryExt` does not retain the `nix::dir::Entry` (v0.5.0): `new()` copies out name, inode and `d_type` into a ≤80-byte struct (`EntryName` keeps names ≤38 bytes inline). Don't reintroduce the raw `Entry` or compare/hash through it: nix only initialises `d_reclen` bytes of the dirent, while the libc derives read the full struct including uninitialized `d_name` tail bytes.
 - `unsafe impl Sync for OpenHandles` is sound only while every `&self` method on `DirHandle` stays away from the underlying `DIR*` stream (no readdir/telldir/seekdir). Anything touching stream position must take `&mut self`.

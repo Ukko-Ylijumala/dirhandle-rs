@@ -14,14 +14,13 @@ use nix::{
 use std::{
     cmp::{Eq, Ord, Ordering, PartialEq, PartialOrd},
     collections::VecDeque,
-    ffi::OsStr,
+    ffi::{CStr, OsStr},
     fmt::{self, Debug, Display, Formatter},
     fs::{read_link, File, OpenOptions},
     hash::{Hash, Hasher},
     io,
     iter::Peekable,
     marker::PhantomData,
-    mem,
     ops::{Deref, DerefMut},
     os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd, RawFd},
     os::unix::ffi::OsStrExt,
@@ -51,19 +50,27 @@ treated as "maybe changed" and fall through to the full comparison.
 const MTIME_SLACK_SECS: f64 = 2.0;
 /*
 Stable typenum values for `EntryExt::typenum()`. They feed the
-[DirectoryState] digests, so they are pinned here instead of being derived
-from nix's [Type] discriminants (`t as u8`), which upstream could reorder
-and thereby silently change every stored hash. The values match the nix
-0.30 enum order, so digests computed by earlier 0.4.x versions stay valid.
+[DirectoryState] digests, so they are pinned to the kernel's `d_type`
+ABI (`DT_*`) rather than derived from nix's [Type] discriminants, which
+upstream could reorder and thereby silently change every stored hash.
+NOTE: v0.4 used the nix enum order (0..6, unknown = 254); v0.5.0 switched
+to `DT_*` together with the digest fold, so 0.4 and 0.5 hashes differ.
 */
-const TYPENUM_FIFO:    u8 = 0;
-const TYPENUM_CHR:     u8 = 1;
-const TYPENUM_DIR:     u8 = 2;
-const TYPENUM_BLK:     u8 = 3;
-const TYPENUM_REG:     u8 = 4;
-const TYPENUM_LNK:     u8 = 5;
-const TYPENUM_SOCK:    u8 = 6;
-const TYPENUM_UNKNOWN: u8 = 254;
+const TYPENUM_FIFO:    u8 = libc::DT_FIFO;
+const TYPENUM_CHR:     u8 = libc::DT_CHR;
+const TYPENUM_DIR:     u8 = libc::DT_DIR;
+const TYPENUM_BLK:     u8 = libc::DT_BLK;
+const TYPENUM_REG:     u8 = libc::DT_REG;
+const TYPENUM_LNK:     u8 = libc::DT_LNK;
+const TYPENUM_SOCK:    u8 = libc::DT_SOCK;
+const TYPENUM_UNKNOWN: u8 = libc::DT_UNKNOWN;
+/*
+Inline capacity of [EntryName] in bytes, including the trailing NUL. 39
+keeps the enum at 48 bytes (payload + tag, 8-aligned because of the heap
+variant's `Box`) while fitting names of up to 38 bytes inline - UUIDs
+(36) included. Anything longer takes one heap allocation.
+*/
+const NAME_INLINE_CAP: usize = 39;
 /*
 Heap footprint of one open directory stream as allocated by glibc's
 `opendir` / `fdopendir` (`sysdeps/posix/opendir.c`): a `struct __dirstream`
@@ -308,15 +315,70 @@ impl From<&DirFd> for RawFd {
 /* ######################################################################### */
 
 /**
-This struct extends the [nix::dir::Entry] struct with additional methods.
-The aim is to be closely compatible with the [std::fs::DirEntry] API.
+Owned, NUL-terminated entry name. Short names (the overwhelming majority)
+live inline, longer ones on the heap; either way both the `&CStr` and the
+`&[u8]` views are free - no `strlen` per call, unlike `dirent.d_name`.
+*/
+#[derive(Clone)]
+enum EntryName {
+    Inline { len: u8, buf: [u8; NAME_INLINE_CAP] },
+    Heap(Box<[u8]>),
+}
 
-Notable differences:
+impl EntryName {
+    fn new(name: &CStr) -> Self {
+        let with_nul: &[u8] = name.to_bytes_with_nul();
+        if with_nul.len() <= NAME_INLINE_CAP {
+            let mut buf: [u8; NAME_INLINE_CAP] = [0; NAME_INLINE_CAP];
+            buf[..with_nul.len()].copy_from_slice(with_nul);
+            // `len` is the name length without the NUL (fits: cap - 1 < 256)
+            Self::Inline { len: (with_nul.len() - 1) as u8, buf }
+        } else {
+            Self::Heap(with_nul.into())
+        }
+    }
+
+    /// The name bytes including the trailing NUL.
+    #[inline]
+    fn with_nul(&self) -> &[u8] {
+        match self {
+            Self::Inline { len, buf } => &buf[..=*len as usize],
+            Self::Heap(bytes) => bytes,
+        }
+    }
+
+    #[inline]
+    fn as_bytes(&self) -> &[u8] {
+        let bytes: &[u8] = self.with_nul();
+        &bytes[..bytes.len() - 1]
+    }
+
+    #[inline]
+    fn as_cstr(&self) -> &CStr {
+        /*
+        SAFETY: `with_nul()` returns exactly the bytes of the `CStr` this
+        name was built from (`new()` copies `to_bytes_with_nul()`), so the
+        slice has no interior NUL and ends with one.
+        */
+        unsafe { CStr::from_bytes_with_nul_unchecked(self.with_nul()) }
+    }
+}
+
+/**
+A directory entry, aiming to be closely compatible with the
+[std::fs::DirEntry] API. Built from a [nix::dir::Entry] but does **not**
+keep one: the 280-byte `dirent` (256 of them the `d_name` array) is reduced
+to an owned name, the inode and `d_type` at construction, which makes an
+entry ~80 bytes instead of ~440 and keeps the lookahead buffer, `Vec`
+sorts and the `Peekable` slot cheap to move through. `file_name()`,
+`ino()` and `d_type()` cover what the old `Deref<Target = Entry>` exposed.
+
+Notable differences to `std`:
 - `metadata()` is replaced with `stat()`, and we return a [libc::stat] struct
 - `file_type()` is replaced with a custom implementation, which uses `fstatat()`
   if the file type is not available in the `dirent` struct
-- the stat result is cached in a `OnceLock` to avoid calling `fstatat()`
-  multiple times for the same entry.
+- the stat result is cached in a `OnceLock` (boxed, to keep the entry
+  compact) to avoid calling `fstatat()` multiple times for the same entry.
 
 The `'h` lifetime ties each entry to the [DirHandle] that produced it via
 a [BorrowedFd]: the parent handle's directory fd must remain open for as
@@ -326,25 +388,24 @@ vec, so use-after-close zombies are not constructible from safe code.
 */
 #[derive(Clone)]
 pub struct EntryExt<'h> {
-    entry: Entry,
+    name: EntryName,
+    ino: u64,
+    /// `d_type` as reported by `readdir`; `None` when `DT_UNKNOWN`
+    d_type: Option<Type>,
     dirfd: BorrowedFd<'h>,
-    stat: OnceLock<Option<libc::stat>>,
+    /// lazily cached `fstatat` result; `Some(None)` = stat failed
+    stat: OnceLock<Option<Box<libc::stat>>>,
 }
 
 impl<'h> Eq for EntryExt<'h> {}
 
-/**
-Hand-written so that logging an entry prints its name, inode and type
-instead of nix's derived output, which dumps the whole 280-byte dirent
-including all 256 bytes of `d_name` - unusable and expensive at trace
-level, where this is formatted once per entry.
-*/
+/// Hand-written so that the `name` and `stat` fields print usefully.
 impl<'h> Debug for EntryExt<'h> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.debug_struct("EntryExt")
             .field("name", &self.file_name())
-            .field("ino", &self.ino())
-            .field("d_type", &self.entry.file_type())
+            .field("ino", &self.ino)
+            .field("d_type", &self.d_type)
             .field("dirfd", &self.dirfd.as_raw_fd())
             // None: not statted yet; Some(false): stat() failed
             .field("statted", &self.stat.get().map(Option::is_some))
@@ -353,21 +414,49 @@ impl<'h> Debug for EntryExt<'h> {
 }
 
 impl<'h> EntryExt<'h> {
-    /// Create an `EntryExt` from a given [Entry] and its parent directory fd.
+    /**
+    Create an `EntryExt` from a [nix::dir::Entry] and its parent directory
+    fd. Only the name, inode and `d_type` are copied out; the `Entry` is
+    not retained (see the type docs).
+    */
     #[instrument(level = "trace", skip(entry), fields(name = ?entry.file_name()))]
-    pub fn new(entry: Entry, dirfd: BorrowedFd<'h>) -> Self {
+    pub fn new(entry: &Entry, dirfd: BorrowedFd<'h>) -> Self {
         Self {
-            entry,
+            name: EntryName::new(entry.file_name()),
+            ino: entry.ino(),
+            d_type: entry.file_type(),
             dirfd,
             stat: OnceLock::new(),
         }
     }
 
     /// Create a new `EntryExt` and also `stat()` it before returning it.
-    pub fn new_statted(entry: Entry, dirfd: BorrowedFd<'h>) -> Self {
+    pub fn new_statted(entry: &Entry, dirfd: BorrowedFd<'h>) -> Self {
         let new_e: EntryExt<'h> = Self::new(entry, dirfd);
         new_e.stat();
         new_e
+    }
+
+    /// The entry name exactly as `readdir` returned it (no allocation).
+    #[inline]
+    pub fn file_name(&self) -> &CStr {
+        self.name.as_cstr()
+    }
+
+    /// Inode number of the entry.
+    #[inline]
+    pub fn ino(&self) -> u64 {
+        self.ino
+    }
+
+    /**
+    File type as reported by `readdir` (`dirent.d_type`), **without** the
+    `fstatat` fallback that `file_type()` applies. `None` means the
+    filesystem reported `DT_UNKNOWN`.
+    */
+    #[inline]
+    pub fn d_type(&self) -> Option<Type> {
+        self.d_type
     }
 
     /**
@@ -376,12 +465,14 @@ impl<'h> EntryExt<'h> {
     NOTE: If for some reason we cannot stat the entry, we return `None`.
     */
     pub fn stat(&self) -> Option<libc::stat> {
-        *self.stat.get_or_init(|| {
-            match fstatat(&self.dirfd, self.file_name(), AtFlags::AT_SYMLINK_NOFOLLOW) {
-                Ok(stat) => Some(stat),
-                Err(_) => None,
-            }
-        })
+        self.stat
+            .get_or_init(|| {
+                fstatat(self.dirfd, self.file_name(), AtFlags::AT_SYMLINK_NOFOLLOW)
+                    .ok()
+                    .map(Box::new)
+            })
+            .as_deref()
+            .copied()
     }
 
     /// Refresh and return the stat result for the entry.
@@ -500,9 +591,10 @@ impl<'h> EntryExt<'h> {
         DirHandle::from_fd(fd)
     }
 
+    /// The entry name as raw bytes, without the trailing NUL (no allocation).
     #[inline]
     pub fn name_as_bytes(&self) -> &[u8] {
-        self.file_name().to_bytes()
+        self.name.as_bytes()
     }
     /// Lossily converts the original `Cstr` entry name to a `String`.
     /// If you need the original name, use `file_name()` instead.
@@ -523,9 +615,10 @@ impl<'h> EntryExt<'h> {
         Ok(link.join(OsStr::from_bytes(self.name_as_bytes())))
     }
 
-    /// Return the file type of the entry as a [nix::dir::Type] enum.
+    /// Return the file type of the entry as a [nix::dir::Type] enum,
+    /// falling back to `stat()` when `d_type` is `DT_UNKNOWN`.
     pub fn file_type(&self) -> Option<Type> {
-        if let Some(entry_type) = self.entry.file_type() {
+        if let Some(entry_type) = self.d_type {
             Some(entry_type)
         } else {
             match self.mode() {
@@ -536,10 +629,10 @@ impl<'h> EntryExt<'h> {
     }
 
     /**
-    Return the file type of the entry as a `u8` typenum (see the
-    `TYPENUM_*` constants). This value is part of the stable state digest,
-    so it is an explicit mapping rather than nix's enum discriminant.
-    Unknown is [TYPENUM_UNKNOWN].
+    Return the file type of the entry as a `u8` typenum: the kernel's
+    `DT_*` value (see the `TYPENUM_*` constants). This is part of the
+    stable state digest, so it is an explicit mapping rather than nix's
+    enum discriminant. Unknown is [TYPENUM_UNKNOWN] (`DT_UNKNOWN`).
     */
     #[rustfmt::skip]
     pub fn typenum(&self) -> u8 {
@@ -588,12 +681,14 @@ impl<'h> EntryExt<'h> {
 /* --------------------------------- */
 
 /**
-NOTE: equality is defined over `(name, inode, parent dirfd)`. We must NOT
-delegate to `nix::dir::Entry`'s derived `PartialEq`: nix fills the dirent
-from `readdir_r` into a `MaybeUninit` buffer and only `d_reclen` bytes get
-copied, while libc's derived comparison reads the full 256-byte `d_name`
-array (plus `d_off`/`d_reclen`) - i.e. uninitialized garbage. The same
-logical entry read twice could compare unequal.
+NOTE: equality is defined over `(name, inode, parent dirfd)` - explicit
+fields only. Historical note: this must never go back to comparing raw
+`nix::dir::Entry`s: nix fills the dirent from `readdir_r` into a
+`MaybeUninit` buffer and only `d_reclen` bytes get copied, while libc's
+derived comparison reads the full 256-byte `d_name` array (plus
+`d_off`/`d_reclen`) - i.e. uninitialized garbage. The same logical entry
+read twice could compare unequal. Copying the fields out in `new()` is
+what makes `EntryExt` immune to that.
 */
 impl<'h> PartialEq for EntryExt<'h> {
     fn eq(&self, other: &Self) -> bool {
@@ -624,23 +719,12 @@ impl<'h> PartialOrd for EntryExt<'h> {
     }
 }
 
-impl<'h> Deref for EntryExt<'h> {
-    type Target = Entry;
-
-    fn deref(&self) -> &Self::Target {
-        &self.entry
-    }
-}
-
-/* --------------------------------- */
-
 impl<'h> Hash for EntryExt<'h> {
     /**
     Hashes `(name, inode)` - a subset of the [PartialEq] fields, so the
     `Hash`/`Eq` contract holds. The dirfd is deliberately omitted: hashing
     it would invalidate hashes whenever the directory is reopened under a
-    different fd. We must not delegate to `Entry`'s derived `Hash` either,
-    since that reads uninitialized dirent tail bytes (see [PartialEq]).
+    different fd.
 
     NOTE: this method will **not** produce stable hashes across processes
     due to the standard `hash()` implementation's SipHash algorithm.
@@ -656,15 +740,13 @@ impl<'h> Hash for EntryExt<'h> {
 impl<'h> Xxh3Hashable for EntryExt<'h> {
     fn xxh3<H: Hasher>(&self, state: &mut H) {
         state.write(self.name_as_bytes());
-        state.write_u64(self.entry.ino());
+        state.write_u64(self.ino);
         state.write_u8(self.typenum());
     }
 
     fn xxh3_digest(&self) -> u64 {
         let mut hasher: CustomXxh3Hasher = CustomXxh3Hasher::default();
-        hasher.write(self.name_as_bytes());
-        hasher.write_u64(self.entry.ino());
-        hasher.write_u8(self.typenum());
+        self.xxh3(&mut hasher);
         hasher.finish()
     }
 }
@@ -1240,10 +1322,10 @@ pub struct DirHandleIter<'handle> {
     ordering heuristic. State tracking works exactly as in buffered mode.
     */
     plain: bool,
-    /// per-entry xxh3 digests of dir entries - used for state hashing
-    dirs: Vec<u64>,
-    /// per-entry xxh3 digests of file entries - used for state hashing
-    files: Vec<u64>,
+    /// running digest fold of dir entries - used for state hashing
+    dirs: DigestFold,
+    /// running digest fold of file entries - used for state hashing
+    files: DigestFold,
     /**
     When this pass started (before the first `readdir`). Becomes the
     `when` of the finalized [DirectoryState] - see `state_changed_fast()`
@@ -1281,8 +1363,8 @@ impl<'handle> DirHandleIter<'handle> {
             stat,
             update,
             plain: false,
-            dirs: Vec::new(),
-            files: Vec::new(),
+            dirs: DigestFold::default(),
+            files: DigestFold::default(),
             started: TimeSinceEpoch::new(),
         }
     }
@@ -1363,8 +1445,8 @@ impl<'handle> DirHandleIter<'handle> {
             self.update = false;
             self.state.dirs = self.dirs.len();
             self.state.files = self.files.len();
-            self.state.hash_d = digest_of_digests(mem::take(&mut self.dirs));
-            self.state.hash_f = digest_of_digests(mem::take(&mut self.files));
+            self.state.hash_d = self.dirs.finish();
+            self.state.hash_f = self.files.finish();
             self.state.when = self.started.clone().into();
             trace!(target: "DirHandle.state", "{:?}", self.state);
         }
@@ -1374,11 +1456,7 @@ impl<'handle> DirHandleIter<'handle> {
     fn get_one(&mut self) -> Option<EntryExt<'handle>> {
         let entry: EntryExt<'handle> = next(&mut self.inner, self.dirfd, self.stat)?;
         if self.update {
-            /*
-            store the entry's stable digest for state hashing - 8 bytes
-            per entry instead of cloning the whole EntryExt, which kept
-            the full listing in memory until the pass completed
-            */
+            // fold the entry's stable digest into the running state hash
             let digest: u64 = entry.xxh3_digest();
 
             #[cfg(debug_assertions)]
@@ -1653,7 +1731,7 @@ impl SizeOf for OpenHandles {
             below and must not be folded into the slot size as well - that
             double counted every handle in earlier versions.
             */
-            let slot: usize = mem::size_of::<(RawFd, DirHandle)>();
+            let slot: usize = std::mem::size_of::<(RawFd, DirHandle)>();
             let used: usize = slot * self.0.len();
             let total: usize = slot * self.0.capacity();
             context
@@ -1793,20 +1871,55 @@ fn get_file_handle(path: &Path) -> io::Result<File> {
 }
 
 /**
-Combine per-entry xxh3 digests into a single stable digest. Sorting the
-digests makes the result independent of `readdir` order; the per-entry
-digests already cover `(name, inode, typenum)`, so the same set of
-entries always produces the same combined digest.
+Order-independent accumulator of per-entry xxh3 digests - one per entry
+class (dirs / files) of a [DirectoryState]. The per-entry digests cover
+`(name, inode, typenum)`, so the same set of entries always folds to the
+same combined digest regardless of `readdir` order.
+
+Two commutative folds (wrapping sum and xor) plus the count are mixed
+through xxh3 in `finish()`. Either fold alone would let trivially
+constructed multisets collide (`{a, b}` vs `{c, d}` with `a + b == c + d`);
+the pair requires simultaneous sum *and* xor equality. This is a
+change-detection fingerprint, not a cryptographic commitment.
+
+Replaces the v0.4 scheme (collect every digest, sort, hash the sequence):
+O(1) memory and O(n) time per pass instead of an 8-bytes-per-entry `Vec`
+and an `n log n` sort. Digests are therefore not comparable across the
+0.4 / 0.5 boundary.
 
 This is the single source of truth for [DirectoryState] hashing - both
 the lazy in-iterator computation and `directory_state()` go through it,
 which keeps the two paths comparable.
 */
-fn digest_of_digests(mut digests: Vec<u64>) -> u64 {
-    digests.sort_unstable();
-    let mut xxh: CustomXxh3Hasher = CustomXxh3Hasher::default();
-    digests.iter().for_each(|d: &u64| xxh.write_u64(*d));
-    xxh.finish()
+#[derive(Debug, Default)]
+struct DigestFold {
+    sum: u64,
+    xor: u64,
+    n: usize,
+}
+
+impl DigestFold {
+    #[inline]
+    fn push(&mut self, digest: u64) {
+        self.sum = self.sum.wrapping_add(digest);
+        self.xor ^= digest;
+        self.n += 1;
+    }
+
+    /// Number of digests folded in so far.
+    #[inline]
+    fn len(&self) -> usize {
+        self.n
+    }
+
+    /// The combined digest.
+    fn finish(&self) -> u64 {
+        let mut xxh: CustomXxh3Hasher = CustomXxh3Hasher::default();
+        xxh.write_u64(self.sum);
+        xxh.write_u64(self.xor);
+        xxh.write_u64(self.n as u64);
+        xxh.finish()
+    }
 }
 
 /**
@@ -1822,23 +1935,23 @@ listing early, in which case we return the error instead of a partial
 fn directory_state(dir: &mut DirHandle) -> io::Result<DirectoryState> {
     // stamped before the first readdir - see `state_changed_fast()`
     let started: TimeSinceEpoch = TimeSinceEpoch::new();
-    let mut d_digests: Vec<u64> = Vec::new();
-    let mut f_digests: Vec<u64> = Vec::new();
+    let mut d_fold: DigestFold = DigestFold::default();
+    let mut f_fold: DigestFold = DigestFold::default();
     let mut iter: DirHandleIter = DirHandleIter::with_update(dir, false, false).plain();
     for entry in iter.by_ref() {
         match entry.file_type() {
-            Some(Type::Directory) => d_digests.push(entry.xxh3_digest()),
-            _ => f_digests.push(entry.xxh3_digest()),
+            Some(Type::Directory) => d_fold.push(entry.xxh3_digest()),
+            _ => f_fold.push(entry.xxh3_digest()),
         }
     }
     if let Some(errno) = iter.error() {
         return Err(io::Error::from_raw_os_error(errno as i32));
     }
     Ok(DirectoryState {
-        dirs: d_digests.len(),
-        files: f_digests.len(),
-        hash_d: digest_of_digests(d_digests),
-        hash_f: digest_of_digests(f_digests),
+        dirs: d_fold.len(),
+        files: f_fold.len(),
+        hash_d: d_fold.finish(),
+        hash_f: f_fold.finish(),
         when: started.into(),
     })
 }
@@ -1888,8 +2001,8 @@ fn next<'h>(
 
         // convert the [nix::dir::Entry] to our `EntryExt`
         let entry: EntryExt<'h> = match stat {
-            false => EntryExt::new(entry, dirfd),
-            true => EntryExt::new_statted(entry, dirfd),
+            false => EntryExt::new(&entry, dirfd),
+            true => EntryExt::new_statted(&entry, dirfd),
         };
         trace!(target: "name", "{:?} : {:?}", entry.name(), entry);
         return Some(entry);
@@ -1966,16 +2079,40 @@ mod tests {
     #[test]
     #[rustfmt::skip]
     fn typenums_are_pinned() {
-        // the digest scheme depends on these exact values - they must not
-        // drift with nix's enum order (this is what `t as u8` used to be)
-        assert_eq!(TYPENUM_FIFO, Type::Fifo            as u8);
-        assert_eq!(TYPENUM_CHR,  Type::CharacterDevice as u8);
-        assert_eq!(TYPENUM_DIR,  Type::Directory       as u8);
-        assert_eq!(TYPENUM_BLK,  Type::BlockDevice     as u8);
-        assert_eq!(TYPENUM_REG,  Type::File            as u8);
-        assert_eq!(TYPENUM_LNK,  Type::Symlink         as u8);
-        assert_eq!(TYPENUM_SOCK, Type::Socket          as u8);
-        assert_eq!(TYPENUM_UNKNOWN, 254);
+        // the digest scheme depends on these exact numbers (the kernel's
+        // d_type ABI) - they must never drift with nix's enum order
+        assert_eq!(TYPENUM_UNKNOWN, 0);
+        assert_eq!(TYPENUM_FIFO,    1);
+        assert_eq!(TYPENUM_CHR,     2);
+        assert_eq!(TYPENUM_DIR,     4);
+        assert_eq!(TYPENUM_BLK,     6);
+        assert_eq!(TYPENUM_REG,     8);
+        assert_eq!(TYPENUM_LNK,    10);
+        assert_eq!(TYPENUM_SOCK,   12);
+    }
+
+    #[test]
+    fn entry_ext_is_compact() {
+        // the whole point of v0.5.0's EntryExt: ~80 bytes, not ~440
+        assert_eq!(std::mem::size_of::<EntryName>(), 48);
+        assert!(std::mem::size_of::<EntryExt>() <= 80, "{}", std::mem::size_of::<EntryExt>());
+    }
+
+    #[test]
+    fn entry_name_inline_and_heap() {
+        let short: &CStr = c"short.txt";
+        let exact: &CStr = c"12345678901234567890123456789012345678"; // 38 = cap - 1
+        let long: &CStr = c"123456789012345678901234567890123456789"; // 39 -> heap
+        for (cs, inline) in [(short, true), (exact, true), (long, false)] {
+            let n: EntryName = EntryName::new(cs);
+            assert_eq!(matches!(n, EntryName::Inline { .. }), inline, "{cs:?}");
+            assert_eq!(n.as_cstr(), cs);
+            assert_eq!(n.as_bytes(), cs.to_bytes());
+            assert_eq!(n.with_nul(), cs.to_bytes_with_nul());
+        }
+        let empty: EntryName = EntryName::new(c"");
+        assert_eq!(empty.as_bytes(), b"");
+        assert_eq!(empty.as_cstr(), c"");
     }
 
     #[test]
@@ -2008,13 +2145,22 @@ mod tests {
     }
 
     #[test]
-    fn digest_of_digests_is_order_independent() {
-        let a: u64 = digest_of_digests(vec![1, 2, 3]);
-        let b: u64 = digest_of_digests(vec![3, 1, 2]);
-        assert_eq!(a, b, "same set must digest equal regardless of order");
-        assert_ne!(a, digest_of_digests(vec![1, 2]), "different sets must differ");
-        assert_eq!(digest_of_digests(vec![]), digest_of_digests(vec![]));
-        assert_ne!(digest_of_digests(vec![]), a);
+    fn digest_fold_is_order_independent() {
+        let fold = |ds: &[u64]| -> u64 {
+            let mut f: DigestFold = DigestFold::default();
+            ds.iter().for_each(|d: &u64| f.push(*d));
+            f.finish()
+        };
+        let a: u64 = fold(&[1, 2, 3]);
+        assert_eq!(a, fold(&[3, 1, 2]), "same set must digest equal regardless of order");
+        assert_ne!(a, fold(&[1, 2]), "different sets must differ");
+        assert_eq!(fold(&[]), fold(&[]));
+        assert_ne!(fold(&[]), a);
+        // a sum-only fold would collide here (1 + 4 == 2 + 3); xor differs
+        assert_ne!(fold(&[1, 4]), fold(&[2, 3]));
+        // sum and xor both 0, only the count tells these apart
+        assert_ne!(fold(&[0]), fold(&[]));
+        assert_ne!(fold(&[7, 7]), fold(&[]));
     }
 
     #[test]
