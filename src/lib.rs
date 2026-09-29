@@ -591,14 +591,24 @@ impl<'h> EntryExt<'h> {
     Open this entry as a new [DirHandle], if it is a directory.
 
     Like `open()`, this resolves via `openat2` with `RESOLVE_BENEATH`
-    (plus `O_DIRECTORY`, `O_CLOEXEC` and `O_NONBLOCK`), so descending
-    into a subdirectory needs neither procfs nor path re-resolution and
-    is immune to rename races by construction - the natural primitive
-    for recursive tree scans. Fails with `ENOTDIR` on non-directories.
+    (plus `O_DIRECTORY`, `O_NOFOLLOW`, `O_CLOEXEC` and `O_NONBLOCK`), so
+    descending into a subdirectory needs neither procfs nor path
+    re-resolution - the natural primitive for recursive tree scans. Fails
+    with `ENOTDIR` on non-directories, symlinks included.
+
+    Unlike `open()`, it never follows a symlink, not even one that stays
+    beneath the parent: a walker would otherwise recurse forever through
+    `loop -> .`, or descend into a sibling subtree when a directory is
+    swapped for a symlink between `readdir` and this call (the race class
+    of std's CVE-2022-21658). An entry that is a directory when opened
+    here is the directory that gets opened.
     */
     pub fn open_dir(&self) -> io::Result<DirHandle> {
-        let flags: OFlag =
-            OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC | OFlag::O_NONBLOCK;
+        let flags: OFlag = OFlag::O_RDONLY
+            | OFlag::O_DIRECTORY
+            | OFlag::O_NOFOLLOW
+            | OFlag::O_CLOEXEC
+            | OFlag::O_NONBLOCK;
         let open_how: OpenHow = OpenHow::new()
             .flags(flags)
             .resolve(ResolveFlag::RESOLVE_BENEATH);

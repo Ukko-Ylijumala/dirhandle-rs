@@ -414,9 +414,10 @@ fn open_dir_descends_and_stays_beneath() {
     let sub: PathBuf = td.subdir("sub");
     fs::write(sub.join("inner.txt"), b"x").unwrap();
     td.file("plain.txt", b"p");
-    // a symlink escaping the tree, and one staying beneath
+    // a symlink escaping the tree, one staying beneath, and a loop
     std::os::unix::fs::symlink("/", td.path().join("escape")).unwrap();
     std::os::unix::fs::symlink("sub", td.path().join("benign")).unwrap();
+    std::os::unix::fs::symlink(".", td.path().join("loop")).unwrap();
 
     let mut h = DirHandle::new(td.path()).unwrap();
     let entries: Vec<EntryExt> = h.iter().collect();
@@ -432,11 +433,15 @@ fn open_dir_descends_and_stays_beneath() {
     // non-directories are rejected
     assert!(by_name(b"plain.txt").open_dir().is_err(), "ENOTDIR expected");
 
-    // RESOLVE_BENEATH: escaping symlinks are rejected by the kernel,
-    // in-tree symlinks resolve fine
-    assert!(by_name(b"escape").open_dir().is_err(), "escape must be blocked");
-    let mut benign: DirHandle = by_name(b"benign").open_dir().expect("in-tree symlink");
-    assert_eq!(benign.iter().count(), 1);
+    /*
+    symlinks are never followed - not only escaping ones (RESOLVE_BENEATH
+    would stop those anyway) but in-tree ones too: following `loop -> .`
+    reopened the parent itself, an endless recursion for a tree walker
+    */
+    for name in [&b"escape"[..], b"benign", b"loop"] {
+        let err = by_name(name).open_dir().expect_err("symlinks must not be followed");
+        assert_eq!(err.raw_os_error(), Some(libc::ENOTDIR), "{err}");
+    }
 }
 
 #[test]
