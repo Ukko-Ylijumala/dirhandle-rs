@@ -4,7 +4,7 @@
 // re-export the crate: downstream can name them without a version-matched dep
 pub use nix;
 
-use custom_xxh3::{hash_bytes, CustomXxh3Hasher, Xxh3Hashable};
+use custom_xxh3::{hash_bytes, QuickXxh3Hasher, Xxh3Hashable};
 use dashmap::{mapref::one::RefMut, DashMap};
 use enhvec::{EnhVec, Sorting};
 use miniutils::{ToDebug, ToDisplay};
@@ -33,6 +33,7 @@ use std::{
         atomic::{AtomicI32, Ordering::Relaxed},
         OnceLock,
     },
+    vec,
 };
 use timesince::TimeSinceEpoch;
 use tracing::{debug, instrument, trace, warn};
@@ -76,12 +77,6 @@ variant's `Box`) while fitting names of up to 38 bytes inline - UUIDs
 (36) included. Anything longer takes one heap allocation.
 */
 const NAME_INLINE_CAP: usize = 39;
-/*
-Stack buffer for the one-shot per-entry digest (`EntryExt::xxh3_digest`):
-a name of up to `NAME_MAX` bytes, the 8-byte inode and the typenum byte.
-Longer names (beyond `NAME_MAX`, e.g. from CIFS) take the streaming path.
-*/
-const DIGEST_BUF_SIZE: usize = libc::NAME_MAX as usize + 8 + 1;
 /*
 Heap footprint of one open directory stream as allocated by glibc's
 `opendir` / `fdopendir` (`sysdeps/posix/opendir.c`): a `struct __dirstream`
@@ -783,26 +778,28 @@ impl<'h> Xxh3Hashable for EntryExt<'h> {
     }
 
     /**
-    One-shot xxh3 over the exact bytes `xxh3()` streams - name, native
-    endian inode, typenum - laid out in a stack buffer. xxh3's streaming
-    and one-shot forms agree for the same input and secret, so digests are
-    bit-identical (unit-tested, value pinned), but no ~700-byte streaming
-    hasher is set up per entry: ~2x faster. Names that do not fit the
-    buffer take the streaming path.
+    Two one-shot xxh3 passes: the name on its own, then that digest (xor
+    typenum) together with the inode - 16 bytes, which [QuickXxh3Hasher]
+    hashes from registers. The name is never copied, and no streaming
+    hasher is set up per entry: ~5 ns for typical names, ~2.5x faster than
+    laying `(name, ino, typenum)` out in a buffer and hashing that once.
+
+    Every input goes through xxh3's full mixing. Seeding a single pass over
+    the name with the inode would be faster still (~3 ns), but for names of
+    up to 8 bytes xxh3 applies the seed by xor/add ahead of a bijective
+    finalizer, so a name change could be cancelled out by a matching inode
+    change. The xor of typenum into the name digest is injective, so a type
+    change alone always changes the digest.
+
+    NOTE: not the value that `xxh3()` streams into a hasher (the trait does
+    not require that); [DirectoryState] digests use only this one.
     */
+    #[inline]
     fn xxh3_digest(&self) -> u64 {
-        let name: &[u8] = self.name_as_bytes();
-        let len: usize = name.len() + 8 + 1;
-        if len > DIGEST_BUF_SIZE {
-            let mut hasher: CustomXxh3Hasher = CustomXxh3Hasher::default();
-            self.xxh3(&mut hasher);
-            return hasher.finish();
-        }
-        let mut buf: [u8; DIGEST_BUF_SIZE] = [0; DIGEST_BUF_SIZE];
-        buf[..name.len()].copy_from_slice(name);
-        buf[name.len()..len - 1].copy_from_slice(&self.ino.to_ne_bytes());
-        buf[len - 1] = self.typenum();
-        hash_bytes(&buf[..len])
+        let mut hasher: QuickXxh3Hasher = QuickXxh3Hasher::new();
+        hasher.write_u64(hash_bytes(self.name_as_bytes()) ^ self.typenum() as u64);
+        hasher.write_u64(self.ino);
+        hasher.finish()
     }
 }
 
@@ -1313,11 +1310,15 @@ impl DirHandle {
         (d_vec, f_vec)
     }
 
-    /// Return the directory entries as sorted tuples of directories and files.
+    /**
+    Return the directory entries as sorted tuples of directories and files.
+    Names are unique within a directory, so no two entries compare equal
+    and the unstable sort (no merge buffer) gives the stable sort's order.
+    */
     pub fn entries_sorted<'handle>(&'handle mut self) -> (EntryVec<'handle>, EntryVec<'handle>) {
         let (mut dirs, mut files) = self.entries(true, true);
-        dirs.sort(Sorting::Ascending);
-        files.sort(Sorting::Ascending);
+        dirs.sort_unstable(Sorting::Ascending);
+        files.sort_unstable(Sorting::Ascending);
         (dirs, files)
     }
 
@@ -1328,13 +1329,10 @@ impl DirHandle {
     - sorts both entry lists alphabetically (separately)
     */
     pub fn iter_sorted(&'_ mut self) -> DirHandleIterSorted<'_> {
-        let (mut dirs, mut files) = self.entries(true, true);
-
-        // NOTE: we sort in reverse order to pop the entries in alphabetical order
-        dirs.sort(Sorting::Descending);
-        files.sort(Sorting::Descending);
-        files.extend(dirs);
-        DirHandleIterSorted(files)
+        let (mut dirs, mut files) = self.entries_sorted();
+        dirs.append(&mut files);
+        // nothing was pushed at the front, so this takes over the buffer as is
+        DirHandleIterSorted(dirs.into_iter())
     }
 }
 
@@ -1614,7 +1612,7 @@ impl<'handle> DirHandleIter<'handle> {
         if self.update {
             self.update = false;
             *self.state =
-                DirectoryState::from_pass(&self.dirs, &self.files, self.started.clone(), self.stamp);
+                DirectoryState::from_pass(&self.dirs, &self.files, self.started, self.stamp);
             trace!(target: "DirHandle.state", "{:?}", self.state);
         }
     }
@@ -1728,17 +1726,30 @@ A sorted iterator over the entries in a directory.
 The `'handle` lifetime comes from the entries themselves (each holds a
 `BorrowedFd<'handle>` of the parent [DirHandle]), so the vec cannot
 outlive the handle - no extra marker needed.
+
+A plain [vec::IntoIter] rather than an [EntryVec]: [EnhVec] has its own
+`Drop`, which (without the unstable `#[may_dangle]` that [Vec] uses) keeps
+the handle borrowed until the iterator goes out of scope, even when it is
+no longer used.
 */
 #[derive(Debug)]
-pub struct DirHandleIterSorted<'handle>(EntryVec<'handle>);
+pub struct DirHandleIterSorted<'handle>(vec::IntoIter<EntryExt<'handle>>);
 
 impl<'handle> Iterator for DirHandleIterSorted<'handle> {
     type Item = EntryExt<'handle>;
 
+    #[inline]
     fn next(&mut self) -> Option<Self::Item> {
-        self.0.pop()
+        self.0.next()
+    }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.0.size_hint()
     }
 }
+
+impl ExactSizeIterator for DirHandleIterSorted<'_> {}
 
 /* ######################################################################### */
 
@@ -2115,7 +2126,7 @@ impl DigestFold {
 
     /// The combined digest.
     fn finish(&self) -> u64 {
-        let mut xxh: CustomXxh3Hasher = CustomXxh3Hasher::default();
+        let mut xxh: QuickXxh3Hasher = QuickXxh3Hasher::new();
         xxh.write_u64(self.sum);
         xxh.write_u64(self.xor);
         xxh.write_u64(self.n as u64);
@@ -2210,7 +2221,7 @@ fn next<'h>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::hash_map::DefaultHasher;
+    use std::collections::{hash_map::DefaultHasher, HashSet};
     use std::ffi::CString;
 
     fn siphash<T: Hash>(item: &T) -> u64 {
@@ -2355,31 +2366,31 @@ mod tests {
     }
 
     #[test]
-    fn one_shot_digest_matches_streaming() {
+    fn entry_digest_covers_name_ino_type() {
         /*
-        The one-shot fast path must reproduce the streaming digest exactly -
-        it feeds every stored DirectoryState. Lengths straddle the inline
-        name cap, xxh3's 240-byte short-input boundary, NAME_MAX and the
-        streaming fallback beyond it.
+        Each of name, inode and type must move the digest on its own - it
+        feeds every stored DirectoryState. Lengths straddle the inline name
+        cap, xxh3's 16 / 128 / 240-byte input boundaries and NAME_MAX.
         */
         let h = DirHandle::new(&std::env::temp_dir()).unwrap();
-        let entry = |name: &CStr| EntryExt {
+        let entry = |name: &CStr, ino: u64, d_type: Type| EntryExt {
             name: EntryName::new(name),
-            ino: 0x0123_4567_89ab_cdef,
-            d_type: Some(Type::File),
+            ino,
+            d_type: Some(d_type),
             dirfd: h.inner.as_fd(),
             stat: OnceLock::new(),
         };
-        for len in [0usize, 1, 16, 38, 39, 231, 232, 240, 255, 256, 300] {
+        let ino: u64 = 0x0123_4567_89ab_cdef;
+        let mut seen: HashSet<u64> = HashSet::new();
+        for len in [0usize, 1, 8, 9, 16, 17, 38, 39, 128, 129, 231, 232, 240, 241, 255, 256, 300] {
             let name: CString = CString::new(vec![b'a' + (len % 26) as u8; len]).unwrap();
-            let e: EntryExt = entry(&name);
-            let mut streaming: CustomXxh3Hasher = CustomXxh3Hasher::default();
-            e.xxh3(&mut streaming);
-            assert_eq!(e.xxh3_digest(), streaming.finish(), "name length {len}");
+            let digest: u64 = entry(&name, ino, Type::File).xxh3_digest();
+            assert!(seen.insert(digest), "name length {len}");
+            assert_ne!(digest, entry(&name, ino ^ 1, Type::File).xxh3_digest(), "ino, length {len}");
+            assert_ne!(digest, entry(&name, ino, Type::Symlink).xxh3_digest(), "type, length {len}");
         }
-        // value from the v0.5 streaming implementation: a change here is a
-        // digest scheme change (version note in state-tracking.md)
-        assert_eq!(entry(c"pinned-entry.dat").xxh3_digest(), 0xab33_b55a_249e_5a5e);
+        // a change here is a digest scheme change (version note in state-tracking.md)
+        assert_eq!(entry(c"pinned-entry.dat", ino, Type::File).xxh3_digest(), 0xadc0_416b_4a9e_fea2);
     }
 
     #[test]
@@ -2431,7 +2442,7 @@ mod tests {
         change - only the early return yields `false` here.
         */
         let far_future = TimeSinceEpoch::new_from(TimeSinceEpoch::new().get() + 1e6);
-        h.state.when = Some(far_future.clone());
+        h.state.when = Some(far_future);
         h.state.files = 99;
         assert!(!h.state_changed_fast().unwrap(), "pre-check must short-circuit");
         assert_eq!(h.state.files, 99, "short-circuit must not touch the stored state");

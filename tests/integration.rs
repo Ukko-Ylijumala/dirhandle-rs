@@ -212,13 +212,25 @@ fn iteration_basics() {
     let sorted: Vec<String> = h.iter_sorted().map(|e| e.name()).collect();
     assert_eq!(sorted, ["adir", "zdir", "a.txt", "b.txt"]);
 
-    // entries() filtering
+    /*
+    entries() filtering. The EnhVecs have their own Drop, so each pair keeps
+    `h` borrowed until it is dropped - shadowing alone does not end that, so
+    the pairs are dropped explicitly before `h` is used again.
+    */
     let (d, f) = h.entries(true, true);
     assert_eq!((d.len(), f.len()), (2, 2));
+    drop((d, f));
     let (d, f) = h.entries(true, false);
     assert_eq!((d.len(), f.len()), (2, 0));
+    drop((d, f));
     let (d, f) = h.entries(false, true);
     assert_eq!((d.len(), f.len()), (0, 2));
+    drop((d, f));
+
+    // iter_sorted() is a plain vec iterator: unused, it does not hold `h`
+    let it = h.iter_sorted();
+    assert_eq!(it.len(), 4);
+    assert_eq!(h.iter().count(), 4);
 
     // for_each operates on the raw stream, including `.` and `..`
     let mut raw_count: usize = 0;
