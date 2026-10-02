@@ -20,7 +20,7 @@ libc = "0.2"
 tracing = "0.1"
 custom_xxh3 = { git = "https://github.com/Ukko-Ylijumala/custom_xxh3", features = ["size_of"] }
 timesince = { git = "https://github.com/Ukko-Ylijumala/timesince-rs" }
-miniutils = { git = "https://github.com/Ukko-Ylijumala/miniutils-rs" }
+miniutils = { git = "https://github.com/Ukko-Ylijumala/miniutils-rs", default-features = false }
 #size-of = { version = "0.1", optional = true }
 
 [dependencies.size-of]
