@@ -755,6 +755,14 @@ fn open_handles_pool() {
     let fd_1: i32 = pool.open(td.path()).unwrap().as_raw_fd();
     let _fd_2: i32 = pool.open(&sub).unwrap().as_raw_fd();
     assert_eq!(pool.len(), 2);
+    // a handle opened some other way joins the pool checked out
+    let fd_3: i32 = {
+        let mut c = pool.adopt(DirHandle::open_beneath(DirHandle::new(td.path()).unwrap(), Path::new("sub")).unwrap());
+        assert_eq!(c.iter().count(), 0);
+        c.as_raw_fd()
+    };
+    assert!(pool.contains(fd_3));
+    pool.close(fd_3);
     let mut seen: usize = 0;
     pool.for_each(|_| seen += 1);
     assert_eq!(seen, 2);

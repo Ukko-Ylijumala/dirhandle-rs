@@ -1894,7 +1894,17 @@ impl OpenHandles {
     into this [OpenHandles] in the same thread.
     */
     pub fn open(&'_ self, path: &Path) -> io::Result<CheckedOutHandle<'_>> {
-        let handle: DirHandle = DirHandle::new(path)?;
+        Ok(self.adopt(DirHandle::new(path)?))
+    }
+
+    /**
+    Insert a handle opened elsewhere (e.g. [DirHandle::open_beneath]) and
+    return it checked out, in one step like [OpenHandles::open].
+
+    **NOTE**: may deadlock if called while holding any kind of reference
+    into this [OpenHandles] in the same thread.
+    */
+    pub fn adopt(&'_ self, handle: DirHandle) -> CheckedOutHandle<'_> {
         let fd: RawFd = handle.as_raw_fd();
         /*
         `entry().insert()` inserts the handle and hands back the write-locked
@@ -1903,7 +1913,7 @@ impl OpenHandles {
         between the insert and the checkout (which the previous
         insert-then-get_mut sequence had to report as an io::Error).
         */
-        Ok(self.wrap(self.0.entry(fd).insert(handle)))
+        self.wrap(self.0.entry(fd).insert(handle))
     }
 
     /// Insert a handle into the map. Replaces an existing handle with the same
