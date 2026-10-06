@@ -3,13 +3,13 @@
 // Integration tests for the public dirhandle API. Each test works in its
 // own unique temp directory (tests run in parallel), cleaned up on drop.
 
-use dirhandle::{open_regular_at, DirHandle, DirectoryState, EntryExt, OpenHandles, StateChange};
+use dirhandle::{open_regular_at, path_fd_at, DirHandle, DirectoryState, EntryExt, OpenHandles, StateChange};
 use std::collections::hash_map::DefaultHasher;
 use std::ffi::{CString, OsStr};
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::io::{ErrorKind, Read};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -549,6 +549,19 @@ fn open_at_by_name_and_from_path_fd() {
     // an O_PATH fd outlives the handle and serves as a dirfd, but is no stream
     let path_fd: OwnedFd = h.path_fd().unwrap();
     assert!(has_cloexec(path_fd.as_raw_fd()), "path_fd must be CLOEXEC");
+    // and one from the fd alone, while the handle's entries still borrow the handle
+    let mut listed = DirHandle::new(td.path()).unwrap();
+    let raw: i32 = listed.as_raw_fd();
+    let entries: Vec<EntryExt> = listed.iter_untracked().collect();
+    let from_fd: OwnedFd = path_fd_at(unsafe { BorrowedFd::borrow_raw(raw) }, c".").unwrap();
+    assert_eq!(entries.len(), 3);
+    assert!(DirHandle::open_at(&from_fd, c"sub").is_ok());
+    // of an entry: a directory, never a symlink or a file
+    assert!(DirHandle::open_at(path_fd_at(&from_fd, c"sub").unwrap(), c"inner").is_ok());
+    for name in [c"benign", c"plain.txt"] {
+        let err = path_fd_at(&from_fd, name).expect_err("ENOTDIR expected");
+        assert_eq!(err.raw_os_error(), Some(libc::ENOTDIR), "{err}");
+    }
     drop(h);
     assert!(DirHandle::open_at(&path_fd, c"sub").is_ok());
     let err = DirHandle::from_fd(path_fd).expect_err("EBADF expected");

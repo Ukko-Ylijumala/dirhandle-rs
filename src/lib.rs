@@ -1184,14 +1184,9 @@ impl DirHandle {
         Self::open_at(at, chunk.as_slice())
     }
 
-    /**
-    A new `O_PATH` fd of this directory: something to open entries
-    relative to (`open_at()`, [read_nofollow_at], ...) that outlives the
-    handle. It is a new open file description, sharing nothing with the
-    handle's directory stream, and it cannot be listed.
-    */
+    /// A new `O_PATH` fd of this directory that outlives the handle: see [path_fd_at].
     pub fn path_fd(&self) -> io::Result<OwnedFd> {
-        openat_how(self, DOT1, PATH_FD_FLAGS, RESOLVE_NO_LINKS)
+        path_fd_at(self, DOT1)
     }
 
     /// Wrap a freshly opened [Dir]; every constructor ends up here.
@@ -2180,6 +2175,22 @@ fn openat_how<Fd: AsFd, P: ?Sized + NixPath>(
 ) -> io::Result<OwnedFd> {
     let open_how: OpenHow = OpenHow::new().flags(flags | OFlag::O_CLOEXEC).resolve(resolve);
     Ok(openat2(dirfd, path, open_how)?)
+}
+
+/**
+A new `O_PATH` fd of the directory `name` in the directory `dirfd` (`.`
+for `dirfd` itself), opened like [DirHandle::open_at]: never through a
+symlink (`ENOTDIR` for one in the last component, `ELOOP` in another),
+nothing above `dirfd` reachable. Something to open entries relative to
+([DirHandle::open_at], [read_nofollow_at], ...) and to `fstat`, that
+outlives whatever `dirfd` belongs to: a new open file description that
+shares nothing with a handle's directory stream, and cannot be listed.
+
+Takes any directory fd, so also one borrowed from a handle whose entries
+still borrow the handle itself.
+*/
+pub fn path_fd_at<Fd: AsFd, P: ?Sized + NixPath>(dirfd: Fd, name: &P) -> io::Result<OwnedFd> {
+    openat_how(dirfd, name, PATH_FD_FLAGS.union(OFlag::O_NOFOLLOW), RESOLVE_NO_LINKS)
 }
 
 /**
