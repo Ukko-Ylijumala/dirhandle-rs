@@ -3,7 +3,7 @@
 // Integration tests for the public dirhandle API. Each test works in its
 // own unique temp directory (tests run in parallel), cleaned up on drop.
 
-use dirhandle::{open_regular_at, path_fd_at, DirHandle, DirectoryState, EntryExt, OpenHandles, StateChange};
+use dirhandle::{open_regular_at, path_fd_at, path_fd_beneath, DirHandle, DirectoryState, EntryExt, OpenHandles, StateChange};
 use std::collections::hash_map::DefaultHasher;
 use std::ffi::{CString, OsStr};
 use std::fs;
@@ -652,6 +652,17 @@ fn open_beneath_resolves_past_path_max() {
     let mut deep = DirHandle::open_beneath(&root, &rel).expect("open past PATH_MAX");
     let names: Vec<String> = deep.iter().map(|e| e.name()).collect();
     assert_eq!(names, ["bottom"]);
+
+    // the same resolution, ending in an O_PATH fd
+    let deep_fd: OwnedFd = path_fd_beneath(&root, &rel).expect("O_PATH past PATH_MAX");
+    assert!(DirHandle::open_at(&deep_fd, c"bottom").is_ok());
+    assert!(path_fd_beneath(&root, Path::new("")).is_ok());
+    let err = path_fd_beneath(&root, Path::new("a/link/c")).expect_err("ELOOP expected");
+    assert_eq!(err.raw_os_error(), Some(libc::ELOOP), "{err}");
+    let err = path_fd_beneath(&root, Path::new("a/link")).expect_err("ENOTDIR expected");
+    assert_eq!(err.raw_os_error(), Some(libc::ENOTDIR), "{err}");
+    let err = path_fd_beneath(&root, Path::new("a/../a")).expect_err("rejected");
+    assert_eq!(err.kind(), ErrorKind::InvalidInput, "{err}");
 }
 
 #[test]

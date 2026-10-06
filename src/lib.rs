@@ -1155,33 +1155,9 @@ impl DirHandle {
     could climb out of `dirfd` across a chunk boundary.
     */
     pub fn open_beneath<Fd: AsFd>(dirfd: Fd, rel: &Path) -> io::Result<Self> {
-        if rel.is_absolute() {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "absolute path"));
-        }
-        let mut held: Option<OwnedFd> = None;
-        let mut chunk: Vec<u8> = Vec::new();
-        for part in rel.as_os_str().as_bytes().split(|b: &u8| *b == b'/') {
-            match part {
-                b"" | DOT1 => continue,
-                DOT2 => return Err(io::Error::new(io::ErrorKind::InvalidInput, "`..` component")),
-                _ => {}
-            }
-            // the chunk is full: resolve it, and continue from there
-            if !chunk.is_empty() && chunk.len() + 1 + part.len() > PATH_CHUNK_MAX {
-                let at: BorrowedFd = held.as_ref().map_or(dirfd.as_fd(), |fd: &OwnedFd| fd.as_fd());
-                held = Some(openat_how(at, chunk.as_slice(), PATH_FD_FLAGS, RESOLVE_NO_LINKS)?);
-                chunk.clear();
-            }
-            if !chunk.is_empty() {
-                chunk.push(b'/');
-            }
-            chunk.extend_from_slice(part);
-        }
-        if chunk.is_empty() {
-            chunk.extend_from_slice(DOT1);
-        }
+        let (held, last): (Option<OwnedFd>, Vec<u8>) = resolve_beneath(dirfd.as_fd(), rel)?;
         let at: BorrowedFd = held.as_ref().map_or(dirfd.as_fd(), |fd: &OwnedFd| fd.as_fd());
-        Self::open_at(at, chunk.as_slice())
+        Self::open_at(at, last.as_slice())
     }
 
     /// A new `O_PATH` fd of this directory that outlives the handle: see [path_fd_at].
@@ -2191,6 +2167,54 @@ still borrow the handle itself.
 */
 pub fn path_fd_at<Fd: AsFd, P: ?Sized + NixPath>(dirfd: Fd, name: &P) -> io::Result<OwnedFd> {
     openat_how(dirfd, name, PATH_FD_FLAGS.union(OFlag::O_NOFOLLOW), RESOLVE_NO_LINKS)
+}
+
+/**
+A new `O_PATH` fd of the directory at `rel` below the directory `dirfd`,
+resolved like [DirHandle::open_beneath] (no symlink in any component,
+chunks past `PATH_MAX`, `InvalidInput` for an absolute `rel` or a `..`)
+and opened like [path_fd_at]. Unlike a [DirHandle], it needs no read
+permission on the directory, only search permission on the way to it.
+*/
+pub fn path_fd_beneath<Fd: AsFd>(dirfd: Fd, rel: &Path) -> io::Result<OwnedFd> {
+    let (held, last): (Option<OwnedFd>, Vec<u8>) = resolve_beneath(dirfd.as_fd(), rel)?;
+    let at: BorrowedFd = held.as_ref().map_or(dirfd.as_fd(), |fd: &OwnedFd| fd.as_fd());
+    path_fd_at(at, last.as_slice())
+}
+
+/**
+Resolve all of `rel` below `dirfd` but its last chunk (see
+[DirHandle::open_beneath]): returns the `O_PATH` fd that chunk is to be
+opened from, if any chunk came before it ([None]: from `dirfd` itself),
+and the chunk, `.` for an empty `rel`.
+*/
+fn resolve_beneath(dirfd: BorrowedFd<'_>, rel: &Path) -> io::Result<(Option<OwnedFd>, Vec<u8>)> {
+    if rel.is_absolute() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "absolute path"));
+    }
+    let mut held: Option<OwnedFd> = None;
+    let mut chunk: Vec<u8> = Vec::new();
+    for part in rel.as_os_str().as_bytes().split(|b: &u8| *b == b'/') {
+        match part {
+            b"" | DOT1 => continue,
+            DOT2 => return Err(io::Error::new(io::ErrorKind::InvalidInput, "`..` component")),
+            _ => {}
+        }
+        // the chunk is full: resolve it, and continue from there
+        if !chunk.is_empty() && chunk.len() + 1 + part.len() > PATH_CHUNK_MAX {
+            let at: BorrowedFd = held.as_ref().map_or(dirfd, |fd: &OwnedFd| fd.as_fd());
+            held = Some(openat_how(at, chunk.as_slice(), PATH_FD_FLAGS, RESOLVE_NO_LINKS)?);
+            chunk.clear();
+        }
+        if !chunk.is_empty() {
+            chunk.push(b'/');
+        }
+        chunk.extend_from_slice(part);
+    }
+    if chunk.is_empty() {
+        chunk.extend_from_slice(DOT1);
+    }
+    Ok((held, chunk))
 }
 
 /**
