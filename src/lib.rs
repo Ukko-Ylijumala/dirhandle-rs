@@ -13,6 +13,7 @@ use nix::{
     errno::Errno,
     fcntl::{fcntl, openat2, AtFlags, FcntlArg, OFlag, OpenHow, ResolveFlag},
     sys::stat::{fstat, fstatat, Mode},
+    NixPath,
 };
 use std::{
     cmp::{Eq, Ord, Ordering, PartialEq, PartialOrd},
@@ -45,6 +46,28 @@ const DOT1: &[u8] = b".";
 const DOT2: &[u8] = b"..";
 const LOOKAHEAD_BUFFER_SIZE: usize = 64;
 const PROC_FD_PATH: &str = "/proc/self/fd";
+/*
+Flags of the opens relative to a directory fd (`openat_how()` adds
+`O_CLOEXEC` to all of them):
+- `O_NOFOLLOW`: a symlink in the last component fails instead of being
+  followed (`ENOTDIR` for a directory open, `ELOOP` for a file open).
+- `O_NONBLOCK`: a FIFO (or an entry swapped for one) cannot block the
+  open; it has no effect on reading regular files or directories.
+*/
+const DIR_OPEN_FLAGS: OFlag = OFlag::O_RDONLY
+    .union(OFlag::O_DIRECTORY)
+    .union(OFlag::O_NOFOLLOW)
+    .union(OFlag::O_NONBLOCK);
+const READ_NOFOLLOW_FLAGS: OFlag = OFlag::O_RDONLY
+    .union(OFlag::O_NOFOLLOW)
+    .union(OFlag::O_NONBLOCK);
+/// An `O_PATH` directory fd: a place to resolve from, not a stream to list.
+const PATH_FD_FLAGS: OFlag = OFlag::O_PATH.union(OFlag::O_DIRECTORY);
+/// Resolution of the no-symlink opens: beneath the dirfd, no symlink in any component.
+const RESOLVE_NO_LINKS: ResolveFlag =
+    ResolveFlag::RESOLVE_BENEATH.union(ResolveFlag::RESOLVE_NO_SYMLINKS);
+/// The longest relative path one `openat2` takes: `PATH_MAX` includes the NUL.
+const PATH_CHUNK_MAX: usize = libc::PATH_MAX as usize - 1;
 /**
 Settling window for the `state_changed_fast()` pre-check. A baseline
 whose directory timestamps ([DirStamp]) lie within this window of the
@@ -574,36 +597,58 @@ impl<'h> EntryExt<'h> {
         self.stat().map(|s: libc::stat| stat_time(s.st_ctime, s.st_ctime_nsec))
     }
 
-    /// Open this entry as a [std::fs::File] with the given flags.
-    /// `O_CLOEXEC` is always added so the fd does not leak across `exec`.
+    /// Open this entry as a [std::fs::File] with the given flags, beneath its directory.
     fn open(&self, flags: OFlag) -> io::Result<File> {
-        let open_how: OpenHow = OpenHow::new()
-            .flags(flags | OFlag::O_CLOEXEC)
-            .resolve(ResolveFlag::RESOLVE_BENEATH);
-        let fd: OwnedFd = openat2(self.dirfd, self.file_name(), open_how)?;
-        Ok(File::from(fd))
+        openat_how(self.dirfd, self.file_name(), flags, ResolveFlag::RESOLVE_BENEATH).map(File::from)
     }
 
-    /// Open this entry for reading as a [std::fs::File] object.
+    /**
+    Open this entry for reading as a [std::fs::File] object.
+
+    A symlink is followed as long as its target stays beneath the
+    directory (`x -> sub/file`); one leading out of it fails with `EXDEV`.
+    To refuse every symlink, use `read_nofollow()`.
+    */
     pub fn read(&self) -> io::Result<File> {
         self.open(OFlag::O_RDONLY)
     }
 
     /// Open this entry for read+write as a [std::fs::File] object.
+    /// Symlinks are followed as in `read()`.
     pub fn write(&self) -> io::Result<File> {
         self.open(OFlag::O_RDWR)
     }
 
     /**
-    Open this entry as a new [DirHandle], if it is a directory.
+    Open this entry for reading without ever following a symlink: see
+    [read_nofollow_at]. For files that may be hostile, where `read()`
+    would let a symlink planted (or swapped in) beneath the directory
+    redirect the read to another file.
+    */
+    pub fn read_nofollow(&self) -> io::Result<File> {
+        read_nofollow_at(self.dirfd, self.file_name())
+    }
 
-    Like `open()`, this resolves via `openat2` with `RESOLVE_BENEATH`
-    (plus `O_DIRECTORY`, `O_NOFOLLOW`, `O_CLOEXEC` and `O_NONBLOCK`), so
-    descending into a subdirectory needs neither procfs nor path
-    re-resolution - the natural primitive for recursive tree scans. Fails
-    with `ENOTDIR` on non-directories, symlinks included.
+    /**
+    Open this entry for reading if it is a regular file: see
+    [open_regular_at]. The `fstat` of the opened file also fills the
+    entry's cached stat if it was not taken yet, so a later `stat()`,
+    `len()` or `mtime()` costs no syscall.
+    */
+    pub fn open_regular(&self) -> io::Result<(File, libc::stat)> {
+        let (file, st) = open_regular_at(self.dirfd, self.file_name())?;
+        let _ = self.stat.set(Some(Box::new(st)));
+        Ok((file, st))
+    }
 
-    Unlike `open()`, it never follows a symlink, not even one that stays
+    /**
+    Open this entry as a new [DirHandle], if it is a directory: see
+    [DirHandle::open_at]. Descending into a subdirectory this way needs
+    neither procfs nor path re-resolution - the natural primitive for
+    recursive tree scans. Fails with `ENOTDIR` on non-directories,
+    symlinks included.
+
+    Unlike `read()`, it never follows a symlink, not even one that stays
     beneath the parent: a walker would otherwise recurse forever through
     `loop -> .`, or descend into a sibling subtree when a directory is
     swapped for a symlink between `readdir` and this call (the race class
@@ -611,16 +656,7 @@ impl<'h> EntryExt<'h> {
     here is the directory that gets opened.
     */
     pub fn open_dir(&self) -> io::Result<DirHandle> {
-        let flags: OFlag = OFlag::O_RDONLY
-            | OFlag::O_DIRECTORY
-            | OFlag::O_NOFOLLOW
-            | OFlag::O_CLOEXEC
-            | OFlag::O_NONBLOCK;
-        let open_how: OpenHow = OpenHow::new()
-            .flags(flags)
-            .resolve(ResolveFlag::RESOLVE_BENEATH);
-        let fd: OwnedFd = openat2(self.dirfd, self.file_name(), open_how)?;
-        DirHandle::from_dir_fd(fd)
+        DirHandle::open_at(self.dirfd, self.file_name())
     }
 
     /// The entry name as raw bytes, without the trailing NUL (no allocation).
@@ -1091,6 +1127,73 @@ impl DirHandle {
         Ok(Self::from_dir(Dir::from_fd(fd)?))
     }
 
+    /**
+    Open the directory `name` in the directory `dirfd` (a [DirHandle], an
+    `O_PATH` fd from `path_fd()`, or any other directory fd): `openat2`
+    with `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS` and `O_DIRECTORY`,
+    `O_NOFOLLOW`, `O_NONBLOCK`, `O_CLOEXEC`. Fails with `ENOTDIR` if
+    `name` is not a directory or is a symlink to one, and with `ELOOP`
+    for a symlink in an inner component, should `name` hold several.
+
+    This is [EntryExt::open_dir] for when the entry itself is no longer at
+    hand, only its directory and its name.
+    */
+    pub fn open_at<Fd: AsFd, P: ?Sized + NixPath>(dirfd: Fd, name: &P) -> io::Result<Self> {
+        Self::from_dir_fd(openat_how(dirfd, name, DIR_OPEN_FLAGS, RESOLVE_NO_LINKS)?)
+    }
+
+    /**
+    Open the directory at `rel`, a relative path below the directory
+    `dirfd`, with no symlink in any of its components (`ELOOP` if there
+    is one) and nothing above `dirfd` reachable. `rel` may be longer than
+    `PATH_MAX`: it is then resolved in chunks, each but the last opened as
+    an `O_PATH` fd to resolve the next one from. An empty `rel` (or `.`)
+    opens `dirfd` itself again, as a new handle.
+
+    Fails with `InvalidInput` for an absolute `rel` or one with a `..`
+    component: chunks are each resolved beneath their own fd, so a `..`
+    could climb out of `dirfd` across a chunk boundary.
+    */
+    pub fn open_beneath<Fd: AsFd>(dirfd: Fd, rel: &Path) -> io::Result<Self> {
+        if rel.is_absolute() {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "absolute path"));
+        }
+        let mut held: Option<OwnedFd> = None;
+        let mut chunk: Vec<u8> = Vec::new();
+        for part in rel.as_os_str().as_bytes().split(|b: &u8| *b == b'/') {
+            match part {
+                b"" | DOT1 => continue,
+                DOT2 => return Err(io::Error::new(io::ErrorKind::InvalidInput, "`..` component")),
+                _ => {}
+            }
+            // the chunk is full: resolve it, and continue from there
+            if !chunk.is_empty() && chunk.len() + 1 + part.len() > PATH_CHUNK_MAX {
+                let at: BorrowedFd = held.as_ref().map_or(dirfd.as_fd(), |fd: &OwnedFd| fd.as_fd());
+                held = Some(openat_how(at, chunk.as_slice(), PATH_FD_FLAGS, RESOLVE_NO_LINKS)?);
+                chunk.clear();
+            }
+            if !chunk.is_empty() {
+                chunk.push(b'/');
+            }
+            chunk.extend_from_slice(part);
+        }
+        if chunk.is_empty() {
+            chunk.extend_from_slice(DOT1);
+        }
+        let at: BorrowedFd = held.as_ref().map_or(dirfd.as_fd(), |fd: &OwnedFd| fd.as_fd());
+        Self::open_at(at, chunk.as_slice())
+    }
+
+    /**
+    A new `O_PATH` fd of this directory: something to open entries
+    relative to (`open_at()`, [read_nofollow_at], ...) that outlives the
+    handle. It is a new open file description, sharing nothing with the
+    handle's directory stream, and it cannot be listed.
+    */
+    pub fn path_fd(&self) -> io::Result<OwnedFd> {
+        openat_how(self, DOT1, PATH_FD_FLAGS, RESOLVE_NO_LINKS)
+    }
+
     /// Wrap a freshly opened [Dir]; every constructor ends up here.
     fn from_dir(inner: Dir) -> Self {
         Self {
@@ -1359,6 +1462,13 @@ impl AsRawFd for DirHandle {
     */
     fn as_raw_fd(&self) -> RawFd {
         self.inner.as_raw_fd()
+    }
+}
+
+impl AsFd for DirHandle {
+    /// Borrowed for no longer than the handle lives, unlike [AsRawFd::as_raw_fd].
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.inner.as_fd()
     }
 }
 
@@ -2059,6 +2169,56 @@ fn get_dir_handle(path: &Path) -> io::Result<Dir> {
     let flags: OFlag =
         OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC | OFlag::O_NONBLOCK;
     Ok(Dir::open(path, flags, Mode::empty())?)
+}
+
+/// `openat2` of `path` relative to `dirfd`. `O_CLOEXEC` is always added so the fd does not leak across `exec`.
+fn openat_how<Fd: AsFd, P: ?Sized + NixPath>(
+    dirfd: Fd,
+    path: &P,
+    flags: OFlag,
+    resolve: ResolveFlag,
+) -> io::Result<OwnedFd> {
+    let open_how: OpenHow = OpenHow::new().flags(flags | OFlag::O_CLOEXEC).resolve(resolve);
+    Ok(openat2(dirfd, path, open_how)?)
+}
+
+/**
+Open `name` in the directory `dirfd` for reading, never through a
+symlink: a symlink as the entry itself fails with `ELOOP`, and so does
+one in any component should `name` hold several. `O_NONBLOCK` keeps a
+FIFO from blocking the open (reads of regular files are unaffected).
+Nothing above `dirfd` is reachable (`RESOLVE_BENEATH`).
+
+The fd-relative counterpart of opening a full path with `O_NOFOLLOW`,
+without its path resolution, its `PATH_MAX` limit, or a symlink swapped
+into a parent component redirecting it. Whatever was opened may still
+be a FIFO or a device; [open_regular_at] also checks that.
+*/
+pub fn read_nofollow_at<Fd: AsFd, P: ?Sized + NixPath>(dirfd: Fd, name: &P) -> io::Result<File> {
+    openat_how(dirfd, name, READ_NOFOLLOW_FLAGS, RESOLVE_NO_LINKS).map(File::from)
+}
+
+/**
+[read_nofollow_at], then one `fstat` of the opened file: only a regular
+file is returned, anything else (a FIFO, a device, a socket - e.g. a
+file replaced since it was listed) fails with `InvalidInput`.
+
+Returns the stat of what was opened, which is what a read of it should
+trust: a stat taken when the entry was listed may be older than the
+file's last write. The inode is not compared with the listing's
+`d_ino`, as the two legitimately differ for a bind-mounted file (and on
+some overlay filesystems); a caller that cares can compare `st_ino`.
+*/
+pub fn open_regular_at<Fd: AsFd, P: ?Sized + NixPath>(
+    dirfd: Fd,
+    name: &P,
+) -> io::Result<(File, libc::stat)> {
+    let file: File = read_nofollow_at(dirfd, name)?;
+    let st: libc::stat = fstat(&file)?;
+    if !EntryType(st.st_mode).is_file() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "not a regular file"));
+    }
+    Ok((file, st))
 }
 
 /**

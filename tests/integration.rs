@@ -3,11 +3,12 @@
 // Integration tests for the public dirhandle API. Each test works in its
 // own unique temp directory (tests run in parallel), cleaned up on drop.
 
-use dirhandle::{DirHandle, DirectoryState, EntryExt, OpenHandles, StateChange};
+use dirhandle::{open_regular_at, DirHandle, DirectoryState, EntryExt, OpenHandles, StateChange};
 use std::collections::hash_map::DefaultHasher;
 use std::ffi::{CString, OsStr};
 use std::fs;
 use std::hash::{Hash, Hasher};
+use std::io::{ErrorKind, Read};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
@@ -71,6 +72,28 @@ fn fd_refers_to(fd: i32, path: &Path) -> bool {
     }
     let md: fs::Metadata = fs::metadata(path).unwrap();
     st.st_dev == md.dev() && st.st_ino == md.ino()
+}
+
+/**
+mkdir a chain of `depth` directories named `name` below `root`, each
+relative to its parent's fd, ending in a `bottom` directory: a path longer
+than `PATH_MAX` can be made no other way. Returns the chain's path
+relative to `root` (without `bottom`).
+*/
+fn mkdir_chain(root: &DirHandle, name: &str, depth: usize) -> PathBuf {
+    let c_name: CString = CString::new(name).unwrap();
+    let mut at: OwnedFd = root.path_fd().unwrap();
+    let mut rel: PathBuf = PathBuf::new();
+    for _ in 0..depth {
+        assert_eq!(unsafe { libc::mkdirat(at.as_raw_fd(), c_name.as_ptr(), 0o755) }, 0);
+        let flags: i32 = libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC;
+        let fd: i32 = unsafe { libc::openat(at.as_raw_fd(), c_name.as_ptr(), flags) };
+        assert!(fd >= 0, "openat of a chain link failed");
+        at = unsafe { OwnedFd::from_raw_fd(fd) };
+        rel.push(name);
+    }
+    assert_eq!(unsafe { libc::mkdirat(at.as_raw_fd(), c"bottom".as_ptr(), 0o755) }, 0);
+    rel
 }
 
 /* ############################ PATH RESOLUTION ############################ */
@@ -497,6 +520,125 @@ fn open_dir_descends_and_stays_beneath() {
         let err = by_name(name).open_dir().expect_err("symlinks must not be followed");
         assert_eq!(err.raw_os_error(), Some(libc::ENOTDIR), "{err}");
     }
+}
+
+#[test]
+fn open_at_by_name_and_from_path_fd() {
+    let td = TestDir::new("open-at");
+    let sub: PathBuf = td.subdir("sub");
+    fs::create_dir(sub.join("inner")).unwrap();
+    td.file("plain.txt", b"p");
+    std::os::unix::fs::symlink("sub", td.path().join("benign")).unwrap();
+
+    let h = DirHandle::new(td.path()).unwrap();
+    let mut sub_h: DirHandle = DirHandle::open_at(&h, c"sub").expect("open_at must work");
+    let names: Vec<String> = sub_h.iter().map(|e| e.name()).collect();
+    assert_eq!(names, ["inner"]);
+    assert!(has_cloexec(sub_h.as_raw_fd()), "open_at fd must be CLOEXEC");
+
+    // the same rules as EntryExt::open_dir: no files, no symlinks
+    for name in [c"plain.txt", c"benign"] {
+        let err = DirHandle::open_at(&h, name).expect_err("ENOTDIR expected");
+        assert_eq!(err.raw_os_error(), Some(libc::ENOTDIR), "{err}");
+    }
+    // several components resolve, but never through a symlink
+    assert!(DirHandle::open_at(&h, c"sub/inner").is_ok());
+    let err = DirHandle::open_at(&h, c"benign/inner").expect_err("ELOOP expected");
+    assert_eq!(err.raw_os_error(), Some(libc::ELOOP), "{err}");
+
+    // an O_PATH fd outlives the handle and serves as a dirfd, but is no stream
+    let path_fd: OwnedFd = h.path_fd().unwrap();
+    assert!(has_cloexec(path_fd.as_raw_fd()), "path_fd must be CLOEXEC");
+    drop(h);
+    assert!(DirHandle::open_at(&path_fd, c"sub").is_ok());
+    let err = DirHandle::from_fd(path_fd).expect_err("EBADF expected");
+    assert_eq!(err.raw_os_error(), Some(libc::EBADF), "{err}");
+}
+
+#[test]
+fn read_nofollow_and_open_regular() {
+    let td = TestDir::new("read-nofollow");
+    let sub: PathBuf = td.subdir("sub");
+    fs::write(sub.join("inner.txt"), b"inner").unwrap();
+    td.file("plain.txt", b"plain");
+    std::os::unix::fs::symlink("sub/inner.txt", td.path().join("benign")).unwrap();
+    std::os::unix::fs::symlink("/etc/hostname", td.path().join("escape")).unwrap();
+    let c_fifo: CString = CString::new(td.path().join("pipe").as_os_str().as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(c_fifo.as_ptr(), 0o644) }, 0);
+
+    let mut h = DirHandle::new(td.path()).unwrap();
+    let entries: Vec<EntryExt> = h.iter_untracked().collect();
+    let by_name = |n: &[u8]| entries.iter().find(|e| e.name_as_bytes() == n).unwrap();
+
+    // read() follows a symlink staying beneath, read_nofollow() never does
+    let mut content: String = String::new();
+    by_name(b"benign").read().unwrap().read_to_string(&mut content).unwrap();
+    assert_eq!(content, "inner");
+    for name in [&b"benign"[..], b"escape"] {
+        let err = by_name(name).read_nofollow().expect_err("ELOOP expected");
+        assert_eq!(err.raw_os_error(), Some(libc::ELOOP), "{err}");
+    }
+    let err = by_name(b"escape").read().expect_err("EXDEV expected");
+    assert_eq!(err.raw_os_error(), Some(libc::EXDEV), "{err}");
+
+    // a FIFO opens without waiting for a writer, but is no regular file
+    let t0 = std::time::Instant::now();
+    assert!(by_name(b"pipe").read_nofollow().is_ok());
+    let err = by_name(b"pipe").open_regular().expect_err("not a regular file");
+    assert_eq!(err.kind(), ErrorKind::InvalidInput, "{err}");
+    assert!(t0.elapsed().as_secs() < 1, "FIFO open must not block");
+    // neither is a directory
+    let err = by_name(b"sub").open_regular().expect_err("not a regular file");
+    assert_eq!(err.kind(), ErrorKind::InvalidInput, "{err}");
+
+    // a regular file comes with the stat of what was opened, cached on the entry
+    let plain: &EntryExt = by_name(b"plain.txt");
+    assert!(!plain.is_statted());
+    let (mut file, st) = plain.open_regular().unwrap();
+    assert_eq!(st.st_size, 5);
+    assert_eq!(st.st_ino, plain.ino());
+    assert!(plain.is_statted());
+    assert_eq!(plain.len(), 5);
+    content.clear();
+    file.read_to_string(&mut content).unwrap();
+    assert_eq!(content, "plain");
+
+    // and the same by dirfd and name, for an entry no longer at hand
+    let (_, st) = open_regular_at(&h, c"sub/inner.txt").unwrap();
+    assert_eq!(st.st_size, 5);
+}
+
+#[test]
+fn open_beneath_resolves_past_path_max() {
+    let td = TestDir::new("open-beneath");
+    fs::create_dir_all(td.path().join("a/b/c")).unwrap();
+    td.file("a/b/c/leaf.txt", b"x");
+    std::os::unix::fs::symlink("b", td.path().join("a/link")).unwrap();
+
+    let root = DirHandle::new(td.path()).unwrap();
+    let mut c = DirHandle::open_beneath(&root, Path::new("a/b/c")).unwrap();
+    let names: Vec<String> = c.iter().map(|e| e.name()).collect();
+    assert_eq!(names, ["leaf.txt"]);
+    // `.` and empty components are skipped; nothing left means the directory itself
+    assert!(DirHandle::open_beneath(&root, Path::new("./a//b/")).is_ok());
+    let mut itself = DirHandle::open_beneath(&root, Path::new("")).unwrap();
+    assert_eq!(itself.iter().count(), 1);
+
+    let err = DirHandle::open_beneath(&root, Path::new("a/link/c")).expect_err("ELOOP expected");
+    assert_eq!(err.raw_os_error(), Some(libc::ELOOP), "{err}");
+    for rel in ["a/../a", "/tmp"] {
+        let err = DirHandle::open_beneath(&root, Path::new(rel)).expect_err("rejected");
+        assert_eq!(err.kind(), ErrorKind::InvalidInput, "{rel}: {err}");
+    }
+
+    // a chain of directories no single path can name
+    let rel: PathBuf = mkdir_chain(&root, &"d".repeat(200), 30);
+    assert!(rel.as_os_str().len() > libc::PATH_MAX as usize);
+    let err = DirHandle::new(&td.path().join(&rel)).expect_err("ENAMETOOLONG expected");
+    assert_eq!(err.raw_os_error(), Some(libc::ENAMETOOLONG), "{err}");
+    let mut deep = DirHandle::open_beneath(&root, &rel).expect("open past PATH_MAX");
+    let names: Vec<String> = deep.iter().map(|e| e.name()).collect();
+    assert_eq!(names, ["bottom"]);
 }
 
 #[test]
