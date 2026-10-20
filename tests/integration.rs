@@ -3,7 +3,10 @@
 // Integration tests for the public dirhandle API. Each test works in its
 // own unique temp directory (tests run in parallel), cleaned up on drop.
 
-use dirhandle::{open_regular_at, path_fd_at, path_fd_beneath, DirHandle, DirectoryState, EntryExt, OpenHandles, StateChange};
+use dirhandle::{
+    birth_time, fstatx, open_regular_at, open_regular_statx_at, path_fd_at, path_fd_beneath, statx_at, DirHandle,
+    DirectoryState, EntryExt, OpenHandles, StateChange, STATX_WITH_BTIME,
+};
 use std::collections::hash_map::DefaultHasher;
 use std::ffi::{CString, OsStr};
 use std::fs;
@@ -726,6 +729,60 @@ fn entry_stat_accessors() {
             assert!(secs > 1.5e9 && secs < 4.0e9, "sane timestamp: {secs}");
         }
     }
+}
+
+#[test]
+fn statx_and_birth_time() {
+    let td = TestDir::new("statx");
+    td.file("plain.txt", b"ten bytes!");
+    std::os::unix::fs::symlink("plain.txt", td.path().join("link")).unwrap();
+    let c_fifo: CString = CString::new(td.path().join("pipe").as_os_str().as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(c_fifo.as_ptr(), 0o644) }, 0);
+    let meta = fs::metadata(td.path().join("plain.txt")).unwrap();
+    // what std says the birth time is: statx too, so the two must agree, absence included
+    let created: Option<(i64, i64)> = meta
+        .created()
+        .ok()
+        .map(|t| t.duration_since(std::time::UNIX_EPOCH).unwrap())
+        .map(|d| (d.as_secs() as i64, i64::from(d.subsec_nanos())));
+
+    let mut h = DirHandle::new(td.path()).unwrap();
+    // the directory itself
+    let st: libc::statx = h.statx(STATX_WITH_BTIME).unwrap();
+    assert_eq!(libc::mode_t::from(st.stx_mode) & libc::S_IFMT, libc::S_IFDIR);
+    assert_eq!(st.stx_ino, fs::metadata(td.path()).unwrap().ino());
+
+    // by name: the file, and the symlink itself (never followed)
+    let st: libc::statx = statx_at(&h, c"plain.txt", STATX_WITH_BTIME).unwrap();
+    assert_eq!((st.stx_size, st.stx_ino), (10, meta.ino()));
+    assert_eq!((st.stx_mtime.tv_sec, i64::from(st.stx_mtime.tv_nsec)), (meta.mtime(), meta.mtime_nsec()));
+    assert_eq!(birth_time(&st), created);
+    let st: libc::statx = statx_at(&h, c"link", libc::STATX_TYPE).unwrap();
+    assert_eq!(libc::mode_t::from(st.stx_mode) & libc::S_IFMT, libc::S_IFLNK);
+    // the kernel may fill more than asked, so only the mask says what is there
+    let mut unmasked: libc::statx = st;
+    unmasked.stx_mask &= !libc::STATX_BTIME;
+    assert_eq!(birth_time(&unmasked), None, "not reported, so not given");
+    let err = statx_at(&h, c"missing", STATX_WITH_BTIME).expect_err("ENOENT expected");
+    assert_eq!(err.raw_os_error(), Some(libc::ENOENT), "{err}");
+
+    // of an open file, and the open-and-statx in one
+    let (file, st) = open_regular_statx_at(&h, c"plain.txt", STATX_WITH_BTIME).unwrap();
+    assert_eq!(st.stx_size, 10);
+    assert_eq!(fstatx(&file, libc::STATX_SIZE).unwrap().stx_size, 10);
+    for name in [c"link", c"pipe"] {
+        let err = open_regular_statx_at(&h, name, 0).expect_err("no symlink, no FIFO");
+        assert!(err.raw_os_error() == Some(libc::ELOOP) || err.kind() == ErrorKind::InvalidInput, "{err}");
+    }
+
+    // through the entry
+    let entries: Vec<EntryExt> = h.iter_untracked().collect();
+    let plain: &EntryExt = entries.iter().find(|e| e.name_as_bytes() == b"plain.txt").unwrap();
+    assert_eq!(plain.statx(libc::STATX_SIZE).unwrap().stx_size, 10);
+    assert!(!plain.is_statted(), "statx() does not fill the stat cache");
+    assert_eq!(plain.btime().map(|t| t.get().floor() as i64), created.map(|(secs, _)| secs));
+    assert_eq!(plain.open_regular_statx(STATX_WITH_BTIME).unwrap().1.stx_size, 10);
+    assert!(!plain.is_statted(), "open_regular_statx() does not either");
 }
 
 /* ############################ OPEN HANDLES ############################### */

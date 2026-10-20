@@ -55,6 +55,8 @@ All of these are thin wrappers around fd-and-name functions, for callers that ke
 
 Beyond `len()`/`mode()`, the cached stat also feeds `is_empty()`, `uid()`, `gid()`, `nlink()`, and `mtime()`/`atime()`/`ctime()`. The timestamps come back as `TimeSinceEpoch` (`f64` seconds — about microsecond precision); callers needing exact nanosecond timespecs should read `stat()` directly.
 
+`statx()` (0.6.5) is the uncached sibling: one `statx(2)` per call, `AT_SYMLINK_NOFOLLOW`, with the caller's mask, for what `libc::stat` has no field for — the birth time (`btime()`, or `birth_time()` on the raw result, which checks `stx_mask` first: a filesystem without one reports none rather than zero), the mount id, the attribute bits. It is not cached because a `statx` is not a `stat`: the entry keeps its 80-byte footprint and its one `OnceLock`, and `open_regular_statx()` likewise leaves the cache alone, where `open_regular()` fills it. The free functions `fstatx()` / `statx_at()` / `open_regular_statx_at()` are the fd-and-name forms, as with the opens.
+
 ## Equality, ordering, hashing
 
 `Eq`, `Ord` and `Hash` are all defined over explicit field tuples. Historical note, in case anyone is tempted to store the `Entry` again: up to nix 0.30, nix filled the dirent from `readdir_r` into a `MaybeUninit` buffer and only `d_reclen` bytes were copied, while the libc derives compare/hash the entire struct including `d_off`, `d_reclen` and the uninitialized tail of the 256-byte `d_name` array. Delegating to those made the same logical entry compare unequal (and hash differently) between two reads within one process. nix 0.31 replaced that representation, but copying the fields out in `new()` keeps the design independent of nix's.

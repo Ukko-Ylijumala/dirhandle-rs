@@ -25,6 +25,7 @@ use std::{
     io,
     iter::Peekable,
     marker::PhantomData,
+    mem,
     ops::{Deref, DerefMut},
     os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd},
     os::unix::ffi::OsStrExt,
@@ -41,6 +42,9 @@ use tracing::{debug, instrument, trace, warn};
 
 #[cfg(feature = "size_of")]
 use size_of::{Context, SizeOf};
+
+/// A `statx` mask for the `stat` fields plus the birth time: what [fstatx] and [statx_at] are usually asked for.
+pub const STATX_WITH_BTIME: u32 = libc::STATX_BASIC_STATS | libc::STATX_BTIME;
 
 const DOT1: &[u8] = b".";
 const DOT2: &[u8] = b"..";
@@ -639,6 +643,34 @@ impl<'h> EntryExt<'h> {
         let (file, st) = open_regular_at(self.dirfd, self.file_name())?;
         let _ = self.stat.set(Some(Box::new(st)));
         Ok((file, st))
+    }
+
+    /**
+    `statx(2)` of this entry, never following a symlink: see [statx_at].
+    For what the cached `stat()` does not carry - the birth time above
+    all. Not cached: one syscall per call.
+    */
+    pub fn statx(&self, mask: u32) -> io::Result<libc::statx> {
+        statx_at(self.dirfd, self.file_name(), mask)
+    }
+
+    /**
+    Birth (creation) time of the entry, if it can be `statx`ed and the
+    filesystem keeps one (see [birth_time]). One `statx` per call, not
+    cached like `mtime()` and the others; the same precision caveat.
+    */
+    pub fn btime(&self) -> Option<TimeSinceEpoch> {
+        let st: libc::statx = self.statx(libc::STATX_BTIME).ok()?;
+        birth_time(&st).map(|(secs, nsecs)| stat_time(secs, nsecs))
+    }
+
+    /**
+    [Self::open_regular], with a `statx` of the opened file instead of the
+    `fstat`: see [open_regular_statx_at]. The entry's cached stat is
+    left alone, as a `statx` is not a `stat`.
+    */
+    pub fn open_regular_statx(&self, mask: u32) -> io::Result<(File, libc::statx)> {
+        open_regular_statx_at(self.dirfd, self.file_name(), mask)
     }
 
     /**
@@ -1263,6 +1295,11 @@ impl DirHandle {
     /// `fstat()` the directory itself (not its entries).
     pub fn stat(&self) -> io::Result<libc::stat> {
         Ok(fstat(&self.inner)?)
+    }
+
+    /// `statx(2)` the directory itself (not its entries): see [fstatx].
+    pub fn statx(&self, mask: u32) -> io::Result<libc::statx> {
+        fstatx(&self.inner, mask)
     }
 
     /**
@@ -2264,6 +2301,78 @@ pub fn open_regular_at<Fd: AsFd, P: ?Sized + NixPath>(
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "not a regular file"));
     }
     Ok((file, st))
+}
+
+/**
+[read_nofollow_at], then one `statx` of the opened file: as
+[open_regular_at], for a caller that wants what `stat` does not carry
+(the birth time, say) without a second syscall. `STATX_TYPE` is always
+asked for, as the check needs it; see [fstatx] for `mask`.
+*/
+pub fn open_regular_statx_at<Fd: AsFd, P: ?Sized + NixPath>(
+    dirfd: Fd,
+    name: &P,
+    mask: u32,
+) -> io::Result<(File, libc::statx)> {
+    let file: File = read_nofollow_at(dirfd, name)?;
+    let st: libc::statx = fstatx(&file, mask | libc::STATX_TYPE)?;
+    if !EntryType(libc::mode_t::from(st.stx_mode)).is_file() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "not a regular file"));
+    }
+    Ok((file, st))
+}
+
+/**
+`statx(2)` of the open file `fd` itself (`AT_EMPTY_PATH`; an `O_PATH` fd
+will do), for what `stat` does not carry: the birth time, the mount id,
+the attribute bits. `mask` names the fields wanted ([STATX_WITH_BTIME]:
+the `stat` fields plus the birth time); `stx_mask` in the result says
+which fields the filesystem gave (the kernel may fill more than asked,
+and a field it does not report is not to be read), so a birth time is
+read through [birth_time]. The sync mode is
+`AT_STATX_SYNC_AS_STAT`, which is what `fstat` does on a network
+filesystem. Fails with `ENOSYS` on a kernel before 4.11.
+*/
+pub fn fstatx<Fd: AsFd>(fd: Fd, mask: u32) -> io::Result<libc::statx> {
+    statx_raw(fd.as_fd().as_raw_fd(), c"", libc::AT_EMPTY_PATH, mask)
+}
+
+/**
+`statx(2)` of the entry `name` in the directory `dirfd`, never following
+a symlink (the link itself is described): the `statx` counterpart of
+`fstatat` with `AT_SYMLINK_NOFOLLOW`. See [fstatx] for `mask` and the
+result.
+*/
+pub fn statx_at<Fd: AsFd, P: ?Sized + NixPath>(dirfd: Fd, name: &P, mask: u32) -> io::Result<libc::statx> {
+    let fd: RawFd = dirfd.as_fd().as_raw_fd();
+    let res: io::Result<libc::statx> =
+        name.with_nix_path(|name: &CStr| statx_raw(fd, name, libc::AT_SYMLINK_NOFOLLOW, mask))?;
+    res
+}
+
+/**
+The birth (creation) time in a `statx` result as `(secs, nsecs)` since
+the epoch, when the filesystem keeps one (`STATX_BTIME` in `stx_mask`:
+ext4 with 256-byte inodes, XFS v5, Btrfs, ZFS, tmpfs; not ext3-era
+ext4, not every NFS). The kernel sets it when the inode is created and
+offers no way to change it, unlike `mtime`: a file whose birth time is
+younger than its content claims was put there after the fact.
+*/
+pub fn birth_time(st: &libc::statx) -> Option<(i64, i64)> {
+    (st.stx_mask & libc::STATX_BTIME != 0).then(|| (st.stx_btime.tv_sec, i64::from(st.stx_btime.tv_nsec)))
+}
+
+/// The raw `statx` call; `AT_STATX_SYNC_AS_STAT` is always set.
+fn statx_raw(dirfd: RawFd, path: &CStr, flags: libc::c_int, mask: u32) -> io::Result<libc::statx> {
+    // all-zero is a valid statx (an empty mask), and the kernel fills the whole struct on success
+    let mut st: libc::statx = unsafe { mem::zeroed() };
+    let flags: libc::c_int = flags | libc::AT_STATX_SYNC_AS_STAT;
+    // SAFETY: `path` is a valid C string and `st` a writable statx for the call's duration
+    let rc: libc::c_int = unsafe { libc::statx(dirfd, path.as_ptr(), flags, mask, &mut st) };
+    if rc == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(st)
 }
 
 /**
