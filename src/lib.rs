@@ -224,6 +224,8 @@ impl DirFd {
     `set`s cannot both succeed, and a concurrent `clear` either lands
     before or after - never in between the check and the store.
     */
+    // `fetch_update` was renamed `try_update` in Rust 1.95; the MSRV is 1.89
+    #[allow(deprecated)]
     pub fn set(&self, fd: RawFd) -> Result<RawFd, RawFd> {
         self.0
             .fetch_update(Relaxed, Relaxed, |current| {
@@ -241,6 +243,7 @@ impl DirFd {
 
     Atomic with respect to other `set` / `clear` calls.
     */
+    #[allow(deprecated)] // see `set()`
     pub fn clear(&self) {
         let _ = self.0.fetch_update(Relaxed, Relaxed, |current| {
             Some(if current >= 0 { !current } else { UNINIT_FD })
@@ -514,6 +517,15 @@ impl<'h> EntryExt<'h> {
     NOTE: If for some reason we cannot stat the entry, we return `None`.
     */
     pub fn stat(&self) -> Option<libc::stat> {
+        self.stat_ref().copied()
+    }
+
+    /**
+    The cached [libc::stat] of the entry by reference: `stat()` without
+    the 144-byte copy, for reading a field or two. Every field accessor
+    below goes through this. `None` if the entry cannot be stat()ed.
+    */
+    pub fn stat_ref(&self) -> Option<&libc::stat> {
         self.stat
             .get_or_init(|| {
                 fstatat(self.dirfd, self.file_name(), AtFlags::AT_SYMLINK_NOFOLLOW)
@@ -521,7 +533,6 @@ impl<'h> EntryExt<'h> {
                     .map(Box::new)
             })
             .as_deref()
-            .copied()
     }
 
     /// Refresh and return the stat result for the entry.
@@ -543,7 +554,7 @@ impl<'h> EntryExt<'h> {
     Also, if for some reason we cannot stat() the file, we return `0`.
     */
     pub fn len(&self) -> u64 {
-        match self.stat() {
+        match self.stat_ref() {
             Some(stat) => stat.st_size as u64,
             None => 0,
         }
@@ -551,7 +562,7 @@ impl<'h> EntryExt<'h> {
 
     /// Return the mode of the file as a [libc::mode_t] value (`u32`).
     pub fn mode(&self) -> Option<libc::mode_t> {
-        self.stat().map(|s: libc::stat| s.st_mode)
+        self.stat_ref().map(|s: &libc::stat| s.st_mode)
     }
 
     /// Whether the entry is a zero-length file (or stat() failed; see `len()`).
@@ -562,12 +573,12 @@ impl<'h> EntryExt<'h> {
 
     /// Owner uid of the entry, if it can be stat()ed.
     pub fn uid(&self) -> Option<libc::uid_t> {
-        self.stat().map(|s: libc::stat| s.st_uid)
+        self.stat_ref().map(|s: &libc::stat| s.st_uid)
     }
 
     /// Owner gid of the entry, if it can be stat()ed.
     pub fn gid(&self) -> Option<libc::gid_t> {
-        self.stat().map(|s: libc::stat| s.st_gid)
+        self.stat_ref().map(|s: &libc::stat| s.st_gid)
     }
 
     /// Number of hard links to the entry, if it can be stat()ed.
@@ -575,7 +586,7 @@ impl<'h> EntryExt<'h> {
     // and on the former clippy sees an identity conversion - by design.
     #[allow(clippy::useless_conversion)]
     pub fn nlink(&self) -> Option<u64> {
-        self.stat().map(|s: libc::stat| u64::from(s.st_nlink))
+        self.stat_ref().map(|s: &libc::stat| u64::from(s.st_nlink))
     }
 
     /**
@@ -586,19 +597,19 @@ impl<'h> EntryExt<'h> {
     exact nanosecond timespec.
     */
     pub fn mtime(&self) -> Option<TimeSinceEpoch> {
-        self.stat().map(|s: libc::stat| stat_time(s.st_mtime, s.st_mtime_nsec))
+        self.stat_ref().map(|s: &libc::stat| stat_time(s.st_mtime, s.st_mtime_nsec))
     }
 
     /// Last access time of the entry, if it can be stat()ed. See `mtime()`
     /// for the precision caveat.
     pub fn atime(&self) -> Option<TimeSinceEpoch> {
-        self.stat().map(|s: libc::stat| stat_time(s.st_atime, s.st_atime_nsec))
+        self.stat_ref().map(|s: &libc::stat| stat_time(s.st_atime, s.st_atime_nsec))
     }
 
     /// Last status (inode) change time of the entry, if it can be stat()ed.
     /// See `mtime()` for the precision caveat.
     pub fn ctime(&self) -> Option<TimeSinceEpoch> {
-        self.stat().map(|s: libc::stat| stat_time(s.st_ctime, s.st_ctime_nsec))
+        self.stat_ref().map(|s: &libc::stat| stat_time(s.st_ctime, s.st_ctime_nsec))
     }
 
     /// Open this entry as a [std::fs::File] with the given flags, beneath its directory.
@@ -641,7 +652,8 @@ impl<'h> EntryExt<'h> {
     */
     pub fn open_regular(&self) -> io::Result<(File, libc::stat)> {
         let (file, st) = open_regular_at(self.dirfd, self.file_name())?;
-        let _ = self.stat.set(Some(Box::new(st)));
+        // `set()` would box the stat only to drop it again when one is cached
+        self.stat.get_or_init(|| Some(Box::new(st)));
         Ok((file, st))
     }
 

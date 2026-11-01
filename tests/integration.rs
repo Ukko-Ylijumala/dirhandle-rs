@@ -724,6 +724,10 @@ fn entry_stat_accessors() {
         assert_eq!(e.uid().unwrap(), unsafe { libc::getuid() });
         assert_eq!(e.gid().unwrap(), unsafe { libc::getgid() });
         assert_eq!(e.nlink().unwrap(), 1);
+        // the by-reference view is the same cached stat the copy comes from
+        let by_ref: &libc::stat = e.stat_ref().unwrap();
+        assert_eq!((by_ref.st_ino, by_ref.st_size), (e.ino(), e.len() as i64));
+        assert!(std::ptr::eq(by_ref, e.stat_ref().unwrap()), "stat_ref must not re-stat");
         for t in [e.mtime(), e.atime(), e.ctime()] {
             let secs: f64 = t.unwrap().get();
             assert!(secs > 1.5e9 && secs < 4.0e9, "sane timestamp: {secs}");

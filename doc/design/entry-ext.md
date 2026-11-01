@@ -35,7 +35,7 @@ This replaces an earlier design in which `EntryExt` held a cloned `DirFd` (indep
 
 ## Cached stat
 
-The entry holds an `OnceLock<Option<Box<libc::stat>>>`. `stat()` initialises it lazily (one heap allocation on first use); subsequent calls return the cached value. `stat_refresh()` clears the lock and re-stats. The `Option` inside the lock means "we already tried and failed" is cached too — repeated stat failures do not retrigger the syscall.
+The entry holds an `OnceLock<Option<Box<libc::stat>>>`. `stat()` initialises it lazily (one heap allocation on first use); subsequent calls return the cached value. `stat_ref()` is the same cache by reference, without the 144-byte copy, and every field accessor (`len()`, `mode()`, `uid()`, `mtime()`, ...) goes through it. `stat_refresh()` clears the lock and re-stats. The `Option` inside the lock means "we already tried and failed" is cached too — repeated stat failures do not retrigger the syscall.
 
 `stat()` is the only path that can promote an entry's known type from `None` to something useful: when `dirent.d_type` is `DT_UNKNOWN` (some filesystems never populate it), `file_type()` falls back to `EntryType(self.mode()).entry_t()`. The local `EntryType` struct exists because `std::sys::pal::unix::fs::FileType`, which performs the same `S_IFMT` masking, is private and cannot be imported.
 
