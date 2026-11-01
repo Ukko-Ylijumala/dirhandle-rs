@@ -23,7 +23,7 @@ use std::{
     fs::{read_link, File, OpenOptions},
     hash::{Hash, Hasher},
     io,
-    iter::Peekable,
+    iter::{FusedIterator, Peekable},
     marker::PhantomData,
     mem,
     ops::{Deref, DerefMut},
@@ -1412,8 +1412,17 @@ impl DirHandle {
         dirs: bool,
         files: bool,
     ) -> (EntryVec<'handle>, EntryVec<'handle>) {
-        let mut d_vec: EntryVec<'handle> = EnhVec::new();
-        let mut f_vec: EntryVec<'handle> = EnhVec::new();
+        /*
+        An established state knows the counts of the last tracked pass: a
+        capacity hint (the directory may have changed since), which saves
+        the doublings on a large directory. An empty handle sizes nothing.
+        */
+        let (n_dirs, n_files): (usize, usize) = match self.state.when {
+            Some(_) => (self.state.dirs, self.state.files),
+            None => (0, 0),
+        };
+        let mut d_vec: EntryVec<'handle> = EnhVec::new_with_capacity(if dirs { n_dirs } else { 0 });
+        let mut f_vec: EntryVec<'handle> = EnhVec::new_with_capacity(if files { n_files } else { 0 });
         // everything gets partitioned (and usually sorted) afterwards, so
         // the dir-first lookahead of `iter()` would be wasted work here
         DirHandleIter::new(self, false).plain().for_each(|entry: EntryExt<'handle>| {
@@ -1452,11 +1461,41 @@ impl DirHandle {
     - sorts both entry lists alphabetically (separately)
     */
     pub fn iter_sorted(&'_ mut self) -> DirHandleIterSorted<'_> {
-        let (mut dirs, mut files) = self.entries_sorted();
-        dirs.append(&mut files);
-        // nothing was pushed at the front, so this takes over the buffer as is
-        DirHandleIterSorted(dirs.into_iter())
+        /*
+        One vector, filled by one plain pass and sorted in two halves - not
+        `entries_sorted()` plus an `append`, which copied every file entry
+        once more into a second large allocation (fresh pages, and so page
+        faults, whenever that one lands above glibc's mmap threshold).
+        The capacity hint is as in `entries()`.
+        */
+        let hint: usize = match self.state.when {
+            Some(_) => self.state.dirs + self.state.files,
+            None => 0,
+        };
+        let mut all: Vec<EntryExt<'_>> = Vec::with_capacity(hint);
+        all.extend(DirHandleIter::new(self, false).plain());
+        let n_dirs: usize = partition_dirs_first(&mut all);
+        // names are unique within a directory: the unstable sort is stable here
+        all[..n_dirs].sort_unstable();
+        all[n_dirs..].sort_unstable();
+        DirHandleIterSorted(all.into_iter())
     }
+}
+
+/**
+Move the directory entries to the front of `entries` (in place, order
+within each half not kept) and return how many there are. Entries whose
+type cannot be determined count as non-directories, as everywhere else.
+*/
+fn partition_dirs_first(entries: &mut [EntryExt<'_>]) -> usize {
+    let mut n_dirs: usize = 0;
+    for i in 0..entries.len() {
+        if entries[i].is_dir() {
+            entries.swap(n_dirs, i);
+            n_dirs += 1;
+        }
+    }
+    n_dirs
 }
 
 /* --------------------------------- */
@@ -1536,11 +1575,24 @@ struct BufDeque<T> {
 }
 
 impl<'h> BufDeque<EntryExt<'h>> {
-    pub fn new(capacity: usize) -> Self {
+    /**
+    An empty buffer that owns no heap yet: every [DirHandleIter] carries
+    one, but the plain-mode passes (`entries()`, `directory_state()`,
+    `iter_untracked()`) never fill it, so the 64-entry (5 KiB) allocation
+    is deferred to the first `reserve()`, which only `fill_buffer` calls.
+    */
+    pub fn new() -> Self {
         Self {
-            q: VecDeque::with_capacity(capacity),
+            q: VecDeque::new(),
             n_dirs: 0,
         }
+    }
+
+    /// Make room for `n` entries beyond the current length (no-op once
+    /// the buffer has its capacity).
+    #[inline]
+    pub fn reserve(&mut self, n: usize) {
+        self.q.reserve(n);
     }
 
     /// Push an entry to the buffer. Directories to the front, rest to back.
@@ -1585,7 +1637,7 @@ impl<'h> BufDeque<EntryExt<'h>> {
 
 impl<'h> Default for BufDeque<EntryExt<'h>> {
     fn default() -> Self {
-        Self::new(LOOKAHEAD_BUFFER_SIZE)
+        Self::new()
     }
 }
 
@@ -1770,6 +1822,8 @@ impl<'handle> DirHandleIter<'handle> {
     /// Fill the lookahead buffer with entries.
     #[instrument(level = "trace", skip_all)]
     fn fill_buffer(&mut self) {
+        // only called on an empty buffer: allocates the first time, then a no-op
+        self.buf.reserve(LOOKAHEAD_BUFFER_SIZE);
         while self.buf.len() < LOOKAHEAD_BUFFER_SIZE {
             if let Some(entry) = self.get_one() {
                 self.buf.push(entry);
@@ -1783,6 +1837,13 @@ impl<'handle> DirHandleIter<'handle> {
 
 impl<'handle> Iterator for DirHandleIter<'handle> {
     type Item = EntryExt<'handle>;
+
+    /// The buffered entries are certain to be yielded; what the stream
+    /// still holds is unknown.
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.buf.len(), None)
+    }
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.plain {
@@ -1879,7 +1940,23 @@ impl<'handle> Iterator for DirHandleIterSorted<'handle> {
     }
 }
 
+impl<'handle> DoubleEndedIterator for DirHandleIterSorted<'handle> {
+    #[inline]
+    fn next_back(&mut self) -> Option<Self::Item> {
+        self.0.next_back()
+    }
+}
+
 impl ExactSizeIterator for DirHandleIterSorted<'_> {}
+
+impl FusedIterator for DirHandleIterSorted<'_> {}
+
+/**
+Once a pass has ended, `next()` keeps answering `None` without touching
+the stream: the buffer is empty and `done()` is answered by the cached
+end-of-stream (or the sticky error) in the [Peekable] slot.
+*/
+impl FusedIterator for DirHandleIter<'_> {}
 
 /* ######################################################################### */
 
@@ -2810,6 +2887,23 @@ mod tests {
             assert_eq!(total.total_bytes(), size_of::<DirHandle>() + DIR_STREAM_HEADER + buf, "{dir:?}");
             assert_eq!(total.distinct_allocations(), 1);
         }
+    }
+
+    #[test]
+    fn plain_passes_do_not_allocate_the_lookahead_buffer() {
+        let mut h = DirHandle::new(&std::env::temp_dir()).unwrap();
+        let mut plain: DirHandleIter = DirHandleIter::with_update(&mut h, false, false).plain();
+        let _ = plain.by_ref().count();
+        assert_eq!(plain.buf.capacity(), 0, "plain mode must never touch the buffer");
+        drop(plain);
+        let mut buffered: DirHandleIter = h.iter();
+        let n: usize = buffered.by_ref().count();
+        if n > 0 {
+            assert!(buffered.buf.capacity() >= LOOKAHEAD_BUFFER_SIZE, "one reserve on first fill");
+        }
+        // fused: a finished pass keeps answering None
+        assert_eq!(buffered.next(), None);
+        assert_eq!(buffered.size_hint(), (0, None));
     }
 
     #[test]

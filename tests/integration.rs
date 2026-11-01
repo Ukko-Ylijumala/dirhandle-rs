@@ -256,6 +256,18 @@ fn iteration_basics() {
     // iter_sorted() is a plain vec iterator: unused, it does not hold `h`
     let it = h.iter_sorted();
     assert_eq!(it.len(), 4);
+    // ... and double-ended: files from the back, dirs from the front
+    let mut it = h.iter_sorted();
+    assert_eq!(it.next_back().unwrap().name(), "b.txt");
+    assert_eq!(it.next().unwrap().name(), "adir");
+    assert_eq!(it.len(), 2);
+    drop(it);
+    // the lookahead iterator reports its buffered entries as the lower bound
+    let mut it = h.iter();
+    assert_eq!(it.size_hint(), (0, None));
+    let _ = it.next();
+    assert_eq!(it.size_hint().0, 3, "the rest of the small directory is buffered");
+    drop(it);
     assert_eq!(h.iter().count(), 4);
 
     // for_each operates on the raw stream, including `.` and `..`
