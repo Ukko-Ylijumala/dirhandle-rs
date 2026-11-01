@@ -13,7 +13,7 @@ Each `DirHandle` carries a `DirectoryState` snapshot:
 
 `when` and `stamp` participate in neither `PartialEq` nor `Hash` — two snapshots with identical content compare (and hash) equal regardless of when they were taken.
 
-The content fields are readable through `dirs()`, `files()`, `hash_dirs()`, `hash_files()` (plus the combined `hash_all()`), and the snapshot time through `when()` / `is_populated()`; `stamp` stays internal to the `state_changed_fast()` pre-check. The digests are stable across processes by design, so a caller can store them and compare against a later run.
+The content fields are readable through `dirs()`, `files()`, `hash_dirs()`, `hash_files()` (plus the combined `hash_all()`), and the snapshot time through `when()` / `is_populated()`; `stamp` stays internal to the `state_changed_fast()` pre-check. The digests are stable across processes by design, so a caller can store them and compare against a later run. The `serde` cargo feature derives `Serialize` / `Deserialize` for `DirectoryState` (content fields plus `when`; `stamp` is skipped, so a deserialized state gets a fresh one from its first full comparison) and for `StateChange`.
 
 ## When state is computed
 

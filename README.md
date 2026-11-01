@@ -26,7 +26,7 @@
 - **Change detection (`DirectoryState`)** tracking dir/file counts and stable `xxh3` hashes.
 - **Lookahead iteration (`DirHandleIter`)** that preferentially yields directory entries before files.
 - **Thread-safe handle pool (`OpenHandles`)** built on `DashMap` with explicit checkout semantics.
-- **Optional memory accounting** via the `size_of` cargo feature.
+- **Optional memory accounting** via the `size_of` cargo feature, and **optional `serde`** support for `DirectoryState` / `StateChange`, so a baseline can be stored and compared against a later run.
 
 ## Project status
 
@@ -56,11 +56,11 @@ dirhandle = { git = "https://github.com/Ukko-Ylijumala/dirhandle-rs" }
 
 `nix` types (`Entry`, `Type`, `Errno`, ...) are part of the API. The crate re-exports the `nix` it was built with as `dirhandle::nix`, so name them through that rather than through a separate `nix` dependency that may be a different version.
 
-Enable optional memory accounting:
+Enable optional memory accounting, and/or `serde` for the stored state:
 
 ```toml
 [dependencies]
-dirhandle = { git = "https://github.com/Ukko-Ylijumala/dirhandle-rs", features = ["size_of"] }
+dirhandle = { git = "https://github.com/Ukko-Ylijumala/dirhandle-rs", features = ["size_of", "serde"] }
 ```
 
 ## Usage

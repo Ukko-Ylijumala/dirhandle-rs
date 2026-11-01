@@ -42,6 +42,8 @@ use tracing::{debug, instrument, trace, warn};
 
 #[cfg(feature = "size_of")]
 use size_of::{Context, SizeOf};
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
 
 /// A `statx` mask for the `stat` fields plus the birth time: what [fstatx] and [statx_at] are usually asked for.
 pub const STATX_WITH_BTIME: u32 = libc::STATX_BASIC_STATS | libc::STATX_BTIME;
@@ -1084,6 +1086,7 @@ respectively, but the reverse is not true. But since we first check for
 `DirNum` and `FileNum` changes, that doesn't matter.
 */
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub enum StateChange {
     Unchanged,
     /// Directory count change: positive = directories added since the previous
@@ -1149,8 +1152,19 @@ impl From<&libc::stat> for DirStamp {
 
 /* --------------------------------- */
 
-/// This struct holds the state of a directory for change detection.
+/**
+This struct holds the state of a directory for change detection.
+
+With the `serde` feature it serializes as its content fields plus
+`when` (`f64` seconds); `stamp` is skipped, so a deserialized state has
+none and the first `state_changed_fast()` on it runs the full comparison
+(which records a fresh stamp) - the `(mtime, ctime)` would be comparable
+across processes, but not necessarily with the clock of wherever the
+state was stored. The digests themselves are stable across processes by
+design, within a digest-scheme version (see `doc/design/state-tracking.md`).
+*/
 #[derive(Clone, Default)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct DirectoryState {
     dirs: usize,
     files: usize,
@@ -1158,6 +1172,7 @@ pub struct DirectoryState {
     hash_f: u64,
     when: Option<TimeSinceEpoch>,
     /// the directory's own timestamps at the start of the pass
+    #[cfg_attr(feature = "serde", serde(skip))]
     stamp: Option<DirStamp>,
 }
 
@@ -3212,6 +3227,25 @@ mod tests {
 
         drop(h);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn directory_state_serde_round_trip() {
+        let mut h = DirHandle::new(std::env::temp_dir()).unwrap();
+        assert!(!h.state_changed().unwrap());
+        let state: DirectoryState = h.state().clone();
+        assert!(state.stamp.is_some());
+        let json: String = serde_json::to_string(&state).unwrap();
+        assert!(!json.contains("stamp"), "the stamp must not travel: {json}");
+        let back: DirectoryState = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, state, "content fields round-trip");
+        assert_eq!(back.when().map(|t| t.get()), state.when().map(|t| t.get()));
+        assert!(back.stamp.is_none(), "a deserialized state starts without a stamp");
+        // StateChange too, with its delta
+        let change: StateChange = StateChange::FileNum(-3);
+        let json: String = serde_json::to_string(&change).unwrap();
+        assert_eq!(serde_json::from_str::<StateChange>(&json).unwrap(), change);
     }
 
     #[cfg(feature = "size_of")]

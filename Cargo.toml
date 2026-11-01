@@ -14,6 +14,10 @@ edition = "2021"
 [features]
 #default = ["size_of"]
 size_of = ["dep:size-of"]
+# Serialize / Deserialize for DirectoryState and StateChange: the digests
+# are stable across processes, so a baseline can be stored and compared
+# against a later run
+serde = ["dep:serde"]
 
 [dependencies]
 libc = "0.2"
@@ -21,6 +25,7 @@ tracing = "0.1"
 custom_xxh3 = { git = "https://github.com/Ukko-Ylijumala/custom_xxh3", features = ["size_of"] }
 timesince = { git = "https://github.com/Ukko-Ylijumala/timesince-rs" }
 miniutils = { git = "https://github.com/Ukko-Ylijumala/miniutils-rs", default-features = false }
+serde = { version = "1.0", optional = true, features = ["derive"] }
 #size-of = { version = "0.1", optional = true }
 
 [dependencies.size-of]
@@ -43,3 +48,4 @@ version = "0.6.5"
 # see the library's own dependencies)
 [dev-dependencies]
 libc = "0.2"
+serde_json = "1.0"
