@@ -4,8 +4,10 @@
 // own unique temp directory (tests run in parallel), cleaned up on drop.
 
 use dirhandle::{
-    birth_time, fstatx, open_regular_at, open_regular_statx_at, partition_dirs_first, path_fd_at, path_fd_beneath,
-    statx_at, DirHandle, DirectoryState, EntryExt, EntryOwned, OpenHandles, StateChange, STATX_WITH_BTIME,
+    birth_time, fstatx, mkdir_at, open_regular_at, open_regular_statx_at, partition_dirs_first, path_fd_at,
+    path_fd_beneath, rename_at, rmdir_at, statx_at, unlink_at, DirHandle, DirectoryState, EntryExt, EntryOwned,
+    OpenHandles, StateChange, STATX_WITH_BTIME,
+    nix::{fcntl::RenameFlags, sys::stat::Mode},
 };
 use std::collections::hash_map::DefaultHasher;
 use std::ffi::{CString, OsStr};
@@ -822,6 +824,77 @@ fn detached_entries_outlive_the_handle() {
     .join()
     .unwrap();
     assert_eq!(len, 2);
+}
+
+#[test]
+fn mutations_beneath_a_handle() {
+    let td = TestDir::new("mutate");
+    td.file("f.txt", b"f");
+    td.file("g.txt", b"g");
+    let sub: PathBuf = td.subdir("sub");
+    std::os::unix::fs::symlink("sub", td.path().join("link")).unwrap();
+
+    let mut h = DirHandle::new(td.path()).unwrap();
+    assert!(!h.state_changed().unwrap(), "baseline");
+    let mode: Mode = Mode::from_bits_truncate(0o755);
+
+    // mkdir: once
+    h.mkdir("made", mode).unwrap();
+    assert!(td.path().join("made").is_dir());
+    assert_eq!(h.mkdir("made", mode).unwrap_err().kind(), ErrorKind::AlreadyExists);
+    assert_eq!(h.mkdir("link", mode).unwrap_err().kind(), ErrorKind::AlreadyExists, "a symlink is an entry");
+
+    // the kinds are checked by the kernel, whatever the caller asked for
+    assert_eq!(h.rmdir("f.txt").unwrap_err().raw_os_error(), Some(libc::ENOTDIR));
+    assert_eq!(h.unlink("made").unwrap_err().raw_os_error(), Some(libc::EISDIR));
+    assert_eq!(h.rmdir("link").unwrap_err().raw_os_error(), Some(libc::ENOTDIR), "a symlink to a dir is no dir");
+    fs::write(sub.join("inner"), b"i").unwrap();
+    assert_eq!(h.rmdir("sub").unwrap_err().raw_os_error(), Some(libc::ENOTEMPTY));
+
+    // remove(): the entry itself, by its kind - the symlink goes, its target stays
+    h.lookup("link").unwrap().remove().unwrap();
+    assert!(sub.is_dir());
+    assert!(!td.path().join("link").symlink_metadata().is_ok());
+    h.lookup("made").unwrap().remove().unwrap();
+    assert!(!td.path().join("made").exists());
+    h.lookup("f.txt").unwrap().remove().unwrap();
+    assert_eq!(h.lookup("f.txt").unwrap_err().kind(), ErrorKind::NotFound);
+
+    // rename in place, no-replace, into another directory, exchange
+    h.rename("g.txt", &h, "h.txt", RenameFlags::empty()).unwrap();
+    assert!(td.path().join("h.txt").is_file());
+    td.file("i.txt", b"i");
+    let err = h.rename("i.txt", &h, "h.txt", RenameFlags::RENAME_NOREPLACE).unwrap_err();
+    assert_eq!(err.raw_os_error(), Some(libc::EEXIST), "{err}");
+    let sub_h = DirHandle::new(&sub).unwrap();
+    h.lookup("i.txt").unwrap().rename_to(&sub_h, "moved.txt", RenameFlags::RENAME_NOREPLACE).unwrap();
+    assert!(sub.join("moved.txt").is_file());
+    assert!(!td.path().join("i.txt").exists());
+    h.rename("h.txt", &sub_h, "inner", RenameFlags::RENAME_EXCHANGE).unwrap();
+    assert_eq!(fs::read(td.path().join("h.txt")).unwrap(), b"i", "swapped");
+    assert_eq!(fs::read(sub.join("inner")).unwrap(), b"g");
+
+    // only single entry names, never paths: nothing but the entry is resolved
+    for bad in ["", ".", "..", "sub/inner", "x/"] {
+        assert_eq!(h.mkdir(bad, mode).unwrap_err().kind(), ErrorKind::InvalidInput, "{bad:?}");
+        assert_eq!(h.unlink(bad).unwrap_err().kind(), ErrorKind::InvalidInput, "{bad:?}");
+        assert_eq!(h.rmdir(bad).unwrap_err().kind(), ErrorKind::InvalidInput, "{bad:?}");
+        assert_eq!(h.rename(bad, &h, "x", RenameFlags::empty()).unwrap_err().kind(), ErrorKind::InvalidInput);
+        assert_eq!(h.rename("h.txt", &h, bad, RenameFlags::empty()).unwrap_err().kind(), ErrorKind::InvalidInput);
+    }
+    assert!(td.path().join("h.txt").is_file(), "nothing was renamed by the rejected calls");
+
+    // the free functions take any directory fd, an O_PATH one included
+    let path_fd: OwnedFd = h.path_fd().unwrap();
+    mkdir_at(&path_fd, "d2", mode).unwrap();
+    rename_at(&path_fd, "d2", &path_fd, "d3", RenameFlags::empty()).unwrap();
+    rmdir_at(&path_fd, "d3").unwrap();
+    unlink_at(&path_fd, "h.txt").unwrap();
+    assert!(!td.path().join("h.txt").exists());
+
+    // the stored state knows nothing of all this until asked
+    assert!(h.state_changed().unwrap());
+    assert!(!h.state_changed().unwrap());
 }
 
 #[test]

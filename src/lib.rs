@@ -11,8 +11,9 @@ use miniutils::{ToDebug, ToDisplay};
 use nix::{
     dir::{Dir, Entry, Iter, Type},
     errno::Errno,
-    fcntl::{fcntl, openat2, readlinkat, AtFlags, FcntlArg, OFlag, OpenHow, ResolveFlag},
-    sys::stat::{fstat, fstatat, Mode},
+    fcntl::{fcntl, openat2, readlinkat, renameat2, AtFlags, FcntlArg, OFlag, OpenHow, RenameFlags, ResolveFlag},
+    sys::stat::{fstat, fstatat, mkdirat, Mode},
+    unistd::{unlinkat, UnlinkatFlags},
     NixPath,
 };
 use std::{
@@ -784,6 +785,36 @@ impl<'h> EntryExt<'h> {
     }
 
     /**
+    Remove this entry from its directory: [rmdir_at] if it is a directory
+    (which must be empty), [unlink_at] otherwise - the entry itself, so a
+    symlink is removed, never its target. The kind is decided from the
+    entry's known type (`d_type`, or the stat), and the kernel checks it
+    again: an entry swapped for one of the other kind since the listing
+    fails with `EISDIR` / `ENOTDIR` rather than being removed. The
+    handle's stored [DirectoryState] is not updated.
+    */
+    pub fn remove(&self) -> io::Result<()> {
+        match self.is_dir() {
+            true => rmdir_at(self.dirfd, self.file_name()),
+            false => unlink_at(self.dirfd, self.file_name()),
+        }
+    }
+
+    /**
+    Rename this entry to `new_name` in the directory `new_dirfd` (its own
+    directory for a rename in place): see [rename_at]. The entry itself
+    keeps its old name - look the new one up, or list again.
+    */
+    pub fn rename_to<Fd: AsFd, P: ?Sized + NixPath>(
+        &self,
+        new_dirfd: Fd,
+        new_name: &P,
+        flags: RenameFlags,
+    ) -> io::Result<()> {
+        rename_at(self.dirfd, self.file_name(), new_dirfd, new_name, flags)
+    }
+
+    /**
     `statx(2)` of this entry, never following a symlink: see [statx_at].
     For what the cached `stat()` does not carry - the birth time above
     all. Not cached: one syscall per call.
@@ -1489,10 +1520,7 @@ impl DirHandle {
     */
     pub fn lookup<P: ?Sized + NixPath>(&self, name: &P) -> io::Result<EntryExt<'_>> {
         let dirfd: BorrowedFd<'_> = self.inner.as_fd();
-        let res: io::Result<EntryExt<'_>> = name.with_nix_path(|name: &CStr| {
-            if matches!(name.to_bytes(), b"" | DOT1 | DOT2) || name.to_bytes().contains(&b'/') {
-                return Err(io::Error::new(io::ErrorKind::InvalidInput, "not an entry name"));
-            }
+        with_entry_name(name, |name: &CStr| {
             let st: libc::stat = fstatat(dirfd, name, AtFlags::AT_SYMLINK_NOFOLLOW)?;
             Ok(EntryExt {
                 name: EntryName::new(name),
@@ -1501,8 +1529,42 @@ impl DirHandle {
                 dirfd,
                 stat: OnceLock::from(Some(Box::new(st))),
             })
-        })?;
-        res
+        })
+    }
+
+    /**
+    Create the directory `name` in this directory (`mkdirat`; `mode`
+    is masked by the umask): see [mkdir_at]. `AlreadyExists` if there is
+    an entry of that name. The new directory is not opened; `open_at()`
+    or `lookup(name)?.open_dir()` does that.
+    */
+    pub fn mkdir<P: ?Sized + NixPath>(&self, name: &P, mode: Mode) -> io::Result<()> {
+        mkdir_at(self, name, mode)
+    }
+
+    /// Remove the non-directory entry `name` of this directory: see [unlink_at].
+    pub fn unlink<P: ?Sized + NixPath>(&self, name: &P) -> io::Result<()> {
+        unlink_at(self, name)
+    }
+
+    /// Remove the empty directory `name` of this directory: see [rmdir_at].
+    pub fn rmdir<P: ?Sized + NixPath>(&self, name: &P) -> io::Result<()> {
+        rmdir_at(self, name)
+    }
+
+    /**
+    Rename the entry `name` of this directory to `new_name` in the
+    directory `new_dirfd` (this handle again for a rename in place):
+    see [rename_at] for the flags and the failure modes.
+    */
+    pub fn rename<Fd: AsFd, P1: ?Sized + NixPath, P2: ?Sized + NixPath>(
+        &self,
+        name: &P1,
+        new_dirfd: Fd,
+        new_name: &P2,
+        flags: RenameFlags,
+    ) -> io::Result<()> {
+        rename_at(self, name, new_dirfd, new_name, flags)
     }
 
     /// Wrap a freshly opened [Dir]; every constructor ends up here.
@@ -2413,9 +2475,12 @@ races). Sharing &OpenHandles is still sound because DashMap's per-shard
 RwLock makes &mut DirHandle access (checkout / for_each_mut) exclusive,
 and concurrent shared access (for_each / iter) only reaches `&self`
 methods of DirHandle - fd(), path(), state(), stat(), statx(), mtime(),
-path_fd(), try_clone(), lookup(), as_raw_fd(), Hash, Eq - none of which
-touch the underlying DIR* stream state: they work on the fd alone
-(fstat / fstatat / openat2 / readlink of procfs).
+path_fd(), try_clone(), lookup(), mkdir(), unlink(), rmdir(), rename(),
+as_raw_fd(), Hash, Eq - none of which touch the underlying DIR* stream
+state: they work on the fd alone (fstat / fstatat / openat2 / the
+`*at` mutators / readlink of procfs). A mutation while another thread
+lists the same handle is an ordinary concurrent directory change, which
+readdir tolerates (the entry may or may not be seen).
 
 INVARIANT: keep it that way. Any future `&self` method on DirHandle
 that reads or moves the DIR* position (readdir/telldir/seekdir/...)
@@ -2712,6 +2777,84 @@ pub fn open_regular_statx_at<Fd: AsFd, P: ?Sized + NixPath>(
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "not a regular file"));
     }
     Ok((file, st))
+}
+
+/**
+Run `f` on `name` as a C string once it is a single entry name, as a
+listing yields one - not a path: `.`, `..`, an empty name and a name
+with a `/` in it fail with `InvalidInput`. The operations that take an
+entry name (`DirHandle::lookup()`, the mutators below) go through this,
+so that no component but the entry itself is ever resolved: no symlink
+in a parent component can redirect them, and nothing above the
+directory fd is reachable. (A symlink as the entry itself is operated
+on, never followed, by every one of these syscalls.)
+*/
+fn with_entry_name<P: ?Sized + NixPath, T>(
+    name: &P,
+    f: impl FnOnce(&CStr) -> io::Result<T>,
+) -> io::Result<T> {
+    name.with_nix_path(|name: &CStr| {
+        if matches!(name.to_bytes(), b"" | DOT1 | DOT2) || name.to_bytes().contains(&b'/') {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "not an entry name"));
+        }
+        f(name)
+    })?
+}
+
+/**
+Create the directory `name` in the directory `dirfd` (`mkdirat`; `mode`
+is masked by the process umask). `name` is a single entry name, not a
+path (see [DirHandle::lookup]), so the parent is `dirfd` and nothing
+else. `AlreadyExists` if there is an entry of that name, a symlink
+included.
+*/
+pub fn mkdir_at<Fd: AsFd, P: ?Sized + NixPath>(dirfd: Fd, name: &P, mode: Mode) -> io::Result<()> {
+    with_entry_name(name, |name: &CStr| Ok(mkdirat(dirfd, name, mode)?))
+}
+
+/**
+Remove the entry `name` of the directory `dirfd` if it is not a
+directory (`unlinkat`): the entry itself, so a symlink is removed, never
+its target, and a file with other links stays reachable through those.
+`EISDIR` for a directory - [rmdir_at] removes an empty one. `name` is a
+single entry name, not a path.
+*/
+pub fn unlink_at<Fd: AsFd, P: ?Sized + NixPath>(dirfd: Fd, name: &P) -> io::Result<()> {
+    with_entry_name(name, |name: &CStr| Ok(unlinkat(dirfd, name, UnlinkatFlags::NoRemoveDir)?))
+}
+
+/**
+Remove the directory `name` of the directory `dirfd` (`unlinkat` with
+`AT_REMOVEDIR`): `ENOTDIR` for anything else (a symlink to a directory
+included), `ENOTEMPTY` for a directory with entries. `name` is a single
+entry name, not a path.
+*/
+pub fn rmdir_at<Fd: AsFd, P: ?Sized + NixPath>(dirfd: Fd, name: &P) -> io::Result<()> {
+    with_entry_name(name, |name: &CStr| Ok(unlinkat(dirfd, name, UnlinkatFlags::RemoveDir)?))
+}
+
+/**
+Rename the entry `name` of the directory `dirfd` to `new_name` in the
+directory `new_dirfd` (`renameat2`), both single entry names, not paths.
+An existing `new_name` is replaced, atomically, unless `flags` holds
+`RENAME_NOREPLACE` (`EEXIST` then); `RENAME_EXCHANGE` swaps the two
+entries instead, which must both exist. A directory can only replace an
+empty directory (`ENOTEMPTY`, `EISDIR` / `ENOTDIR` across kinds), a move
+must stay on one filesystem (`EXDEV`), and a directory cannot move into
+itself (`EINVAL`). The entry itself is moved: a symlink, not its target.
+*/
+pub fn rename_at<Fd1: AsFd, P1: ?Sized + NixPath, Fd2: AsFd, P2: ?Sized + NixPath>(
+    dirfd: Fd1,
+    name: &P1,
+    new_dirfd: Fd2,
+    new_name: &P2,
+    flags: RenameFlags,
+) -> io::Result<()> {
+    with_entry_name(name, |name: &CStr| {
+        with_entry_name(new_name, |new_name: &CStr| {
+            Ok(renameat2(dirfd, name, new_dirfd, new_name, flags)?)
+        })
+    })
 }
 
 /**
