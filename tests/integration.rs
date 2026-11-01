@@ -545,6 +545,13 @@ fn open_dir_descends_and_stays_beneath() {
         let err = by_name(name).open_dir().expect_err("symlinks must not be followed");
         assert_eq!(err.raw_os_error(), Some(libc::ENOTDIR), "{err}");
     }
+
+    // read_link() hands out the raw target, relative or not, without resolving it
+    for (name, target) in [(&b"escape"[..], &b"/"[..]), (b"benign", b"sub"), (b"loop", b".")] {
+        assert_eq!(by_name(name).read_link().unwrap().as_bytes(), target);
+    }
+    let err = by_name(b"plain.txt").read_link().expect_err("not a symlink");
+    assert_eq!(err.raw_os_error(), Some(libc::EINVAL), "{err}");
 }
 
 #[test]
@@ -750,6 +757,12 @@ fn entry_stat_accessors() {
         let by_ref: &libc::stat = e.stat_ref().unwrap();
         assert_eq!((by_ref.st_ino, by_ref.st_size), (e.ino(), e.len() as i64));
         assert!(std::ptr::eq(by_ref, e.stat_ref().unwrap()), "stat_ref must not re-stat");
+        // the entry is on the same device as its directory
+        assert_eq!(e.dev().unwrap(), fs::metadata(td.path()).unwrap().dev());
+        // name views and the procfs-free path agree with path()
+        assert_eq!(e.file_name_os().as_bytes(), e.name_as_bytes());
+        assert_eq!(e.path_in(td.path()), td.path().join(e.file_name_os()));
+        assert_eq!(e.path_in(&td.path().canonicalize().unwrap()), e.path().unwrap());
         for t in [e.mtime(), e.atime(), e.ctime()] {
             let secs: f64 = t.unwrap().get();
             assert!(secs > 1.5e9 && secs < 4.0e9, "sane timestamp: {secs}");

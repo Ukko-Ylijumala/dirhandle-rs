@@ -11,14 +11,14 @@ use miniutils::{ToDebug, ToDisplay};
 use nix::{
     dir::{Dir, Entry, Iter, Type},
     errno::Errno,
-    fcntl::{fcntl, openat2, AtFlags, FcntlArg, OFlag, OpenHow, ResolveFlag},
+    fcntl::{fcntl, openat2, readlinkat, AtFlags, FcntlArg, OFlag, OpenHow, ResolveFlag},
     sys::stat::{fstat, fstatat, Mode},
     NixPath,
 };
 use std::{
     cmp::{Eq, Ord, Ordering, PartialEq, PartialOrd},
     collections::VecDeque,
-    ffi::{CStr, OsStr},
+    ffi::{CStr, OsStr, OsString},
     fmt::{self, Debug, Display, Formatter},
     fs::{read_link, File, OpenOptions},
     hash::{Hash, Hasher},
@@ -565,6 +565,16 @@ impl<'h> EntryExt<'h> {
         self.stat_ref().map(|s: &libc::stat| s.st_mode)
     }
 
+    /**
+    Device (`st_dev`) of the filesystem the entry is on, if it can be
+    stat()ed. With `ino()` the entry's identity across directories: two
+    entries with the same `(dev, ino)` are the same inode (hard links),
+    and a `dev` other than the directory's own marks a mount point.
+    */
+    pub fn dev(&self) -> Option<libc::dev_t> {
+        self.stat_ref().map(|s: &libc::stat| s.st_dev)
+    }
+
     /// Whether the entry is a zero-length file (or stat() failed; see `len()`).
     #[inline]
     pub fn is_empty(&self) -> bool {
@@ -658,6 +668,16 @@ impl<'h> EntryExt<'h> {
     }
 
     /**
+    The target of this entry if it is a symlink (`readlinkat`: no path
+    resolution, no procfs), as the raw bytes the link holds - a relative
+    target stays relative to this directory, and nothing says whether it
+    resolves, or where to. `EINVAL` for an entry that is not a symlink.
+    */
+    pub fn read_link(&self) -> io::Result<OsString> {
+        Ok(readlinkat(self.dirfd, self.file_name())?)
+    }
+
+    /**
     `statx(2)` of this entry, never following a symlink: see [statx_at].
     For what the cached `stat()` does not carry - the birth time above
     all. Not cached: one syscall per call.
@@ -708,6 +728,12 @@ impl<'h> EntryExt<'h> {
     pub fn name_as_bytes(&self) -> &[u8] {
         self.name.as_bytes()
     }
+    /// The entry name as an [OsStr] (no allocation): what [Path::join] and
+    /// the `std::fs` functions take, non-UTF-8 names included.
+    #[inline]
+    pub fn file_name_os(&self) -> &OsStr {
+        OsStr::from_bytes(self.name_as_bytes())
+    }
     /// Lossily converts the original `Cstr` entry name to a `String`.
     /// If you need the original name, use `file_name()` instead.
     #[inline]
@@ -725,7 +751,17 @@ impl<'h> EntryExt<'h> {
     */
     pub fn path(&self) -> io::Result<PathBuf> {
         let link: PathBuf = proc_fd_path(self.dirfd)?;
-        Ok(link.join(OsStr::from_bytes(self.name_as_bytes())))
+        Ok(link.join(self.file_name_os()))
+    }
+
+    /**
+    The entry's path below `dir`, the path of the directory it was listed
+    in: `path()` without the procfs round trip (a `readlink`, an `fstat`
+    and two allocations per call), for a walker that knows where it is.
+    Nothing is checked - the result is a plain join.
+    */
+    pub fn path_in(&self, dir: &Path) -> PathBuf {
+        dir.join(self.file_name_os())
     }
 
     /// Return the file type of the entry as a [nix::dir::Type] enum,
