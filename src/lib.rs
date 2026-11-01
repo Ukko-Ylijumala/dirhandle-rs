@@ -1292,6 +1292,48 @@ impl DirHandle {
         path_fd_at(self, DOT1)
     }
 
+    /**
+    A second, independent handle on this directory: `.` reopened through
+    `openat2` ([DirHandle::open_at]), not a `dup` - a duplicated fd
+    shares the open file description and with it the stream position, so
+    two `DIR` streams on one would read past each other. The new handle
+    has its own fd, its own position and an empty [DirectoryState]: for
+    another thread, or for a listing while this handle's entries are
+    still borrowed. Needs read permission on the directory, as `new()`.
+    */
+    pub fn try_clone(&self) -> io::Result<Self> {
+        Self::open_at(self, DOT1)
+    }
+
+    /**
+    The entry `name` of this directory without listing it: one `fstatat`
+    (never following a symlink), which supplies the inode and the type
+    and fills the entry's stat cache, so `file_type()`, `len()` and the
+    rest then cost nothing. `d_type()` is derived from that stat here,
+    where a listed entry carries what `readdir` said. `NotFound` if there
+    is no such entry.
+
+    `name` is one name, as a listing yields it - not a path: `.`, `..`,
+    an empty name or one with a `/` fail with `InvalidInput`.
+    */
+    pub fn lookup<P: ?Sized + NixPath>(&self, name: &P) -> io::Result<EntryExt<'_>> {
+        let dirfd: BorrowedFd<'_> = self.inner.as_fd();
+        let res: io::Result<EntryExt<'_>> = name.with_nix_path(|name: &CStr| {
+            if matches!(name.to_bytes(), b"" | DOT1 | DOT2) || name.to_bytes().contains(&b'/') {
+                return Err(io::Error::new(io::ErrorKind::InvalidInput, "not an entry name"));
+            }
+            let st: libc::stat = fstatat(dirfd, name, AtFlags::AT_SYMLINK_NOFOLLOW)?;
+            Ok(EntryExt {
+                name: EntryName::new(name),
+                ino: st.st_ino,
+                d_type: EntryType(st.st_mode).entry_t(),
+                dirfd,
+                stat: OnceLock::from(Some(Box::new(st))),
+            })
+        })?;
+        res
+    }
+
     /// Wrap a freshly opened [Dir]; every constructor ends up here.
     fn from_dir(inner: Dir) -> Self {
         Self {
@@ -2194,8 +2236,10 @@ SAFETY: DashMap<RawFd, DirHandle> is not auto-Sync because DirHandle is
 races). Sharing &OpenHandles is still sound because DashMap's per-shard
 RwLock makes &mut DirHandle access (checkout / for_each_mut) exclusive,
 and concurrent shared access (for_each / iter) only reaches `&self`
-methods of DirHandle - fd(), path(), state(), as_raw_fd(), Hash, Eq -
-none of which touch the underlying DIR* stream state.
+methods of DirHandle - fd(), path(), state(), stat(), statx(), mtime(),
+path_fd(), try_clone(), lookup(), as_raw_fd(), Hash, Eq - none of which
+touch the underlying DIR* stream state: they work on the fd alone
+(fstat / fstatat / openat2 / readlink of procfs).
 
 INVARIANT: keep it that way. Any future `&self` method on DirHandle
 that reads or moves the DIR* position (readdir/telldir/seekdir/...)

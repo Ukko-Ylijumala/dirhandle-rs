@@ -732,6 +732,44 @@ fn from_fd_and_dir_stat() {
 }
 
 #[test]
+fn try_clone_and_lookup() {
+    let td = TestDir::new("clone-lookup");
+    td.file("plain.txt", b"12345");
+    td.subdir("sub");
+    std::os::unix::fs::symlink("plain.txt", td.path().join("link")).unwrap();
+
+    let mut h = DirHandle::new(td.path()).unwrap();
+    // an independent handle: its own fd and stream position, its own state
+    let mut twin: DirHandle = h.try_clone().unwrap();
+    assert_ne!(twin.as_raw_fd(), h.as_raw_fd());
+    assert_eq!(twin.path().unwrap(), h.path().unwrap());
+    let mut it = h.iter();
+    let _ = it.next();
+    assert_eq!(twin.iter().count(), 3, "the twin's stream starts at the beginning");
+    assert_eq!(it.count(), 2, "the original's position is untouched");
+    assert_eq!(h.state(), twin.state(), "both passes snapshot the same directory");
+
+    // one entry by name, without a listing: statted, typed, never followed
+    let e: EntryExt = h.lookup("plain.txt").unwrap();
+    assert_eq!(e.name_as_bytes(), b"plain.txt");
+    assert!(e.is_statted(), "the lookup's fstatat must fill the cache");
+    assert!(e.is_file());
+    assert_eq!(e.len(), 5);
+    assert_eq!(e.ino(), fs::metadata(td.path().join("plain.txt")).unwrap().ino());
+    assert!(h.lookup(c"sub").unwrap().is_dir());
+    assert_eq!(h.lookup(c"sub").unwrap().open_dir().unwrap().iter().count(), 0);
+    assert!(h.lookup(&b"link"[..]).unwrap().is_symlink(), "symlinks are not followed");
+    assert_eq!(h.lookup("missing").unwrap_err().kind(), ErrorKind::NotFound);
+    for bad in ["", ".", "..", "sub/inner", "a/"] {
+        assert_eq!(h.lookup(bad).unwrap_err().kind(), ErrorKind::InvalidInput, "{bad:?}");
+    }
+    // the same identity as the listed entry
+    let listed: EntryExt = twin.iter().find(|l| l.name_as_bytes() == b"plain.txt").unwrap();
+    assert_eq!((listed.ino(), listed.file_type()), (e.ino(), e.file_type()));
+    assert_eq!(listed.typenum(), e.typenum());
+}
+
+#[test]
 fn entry_stat_accessors() {
     let td = TestDir::new("accessors");
     td.file("full.txt", b"some bytes");
