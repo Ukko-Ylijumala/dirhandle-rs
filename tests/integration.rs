@@ -399,6 +399,15 @@ fn state_tracking_lifecycle() {
     let current: DirectoryState = h.state_current().unwrap();
     assert_ne!(h.state(), &current, "stored state must remain uninitialized");
     assert_eq!(h.state(), &DirectoryState::default());
+    assert!(!h.state().is_populated());
+    assert!(h.state().when().is_none());
+
+    // the snapshot's fields are readable
+    assert!(current.is_populated());
+    assert!(current.when().is_some());
+    assert_eq!((current.dirs(), current.files()), (1, 1));
+    assert_eq!(current.hash_all(), current.hash_dirs().rotate_left(32) ^ current.hash_files());
+    assert_ne!(current.hash_dirs(), current.hash_files());
 
     // the first complete pass populates the stored state lazily, and the
     // in-iterator hashing path must agree with directory_state()
@@ -412,10 +421,11 @@ fn state_tracking_lifecycle() {
 
     let before: DirectoryState = h2.state().clone();
     td.file("f2.txt", b"2");
-    match before.change(&h2.state_current().unwrap()) {
-        StateChange::FileNum(d) => assert_eq!(d, 1),
-        c => panic!("expected FileNum(1), got {c:?}"),
-    }
+    // StateChange is Copy + Eq: comparable without a match
+    let change: StateChange = before.change(&h2.state_current().unwrap());
+    assert_eq!(change, StateChange::FileNum(1));
+    assert!(!change.is_same());
+    assert_eq!(before.change(&before), StateChange::Unchanged);
     assert!(h2.state_changed().unwrap(), "added file must be detected");
 
     td.subdir("d2");

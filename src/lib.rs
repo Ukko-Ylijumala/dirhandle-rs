@@ -892,7 +892,7 @@ The type of change detected in a directory, if any.
 respectively, but the reverse is not true. But since we first check for
 `DirNum` and `FileNum` changes, that doesn't matter.
 */
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum StateChange {
     Unchanged,
     /// Directory count change: positive = directories added since the previous
@@ -1037,6 +1037,53 @@ impl DirectoryState {
     /// Combined hash of directory and file entry hashes.
     pub fn hash_all(&self) -> u64 {
         self.hash_d.rotate_left(32) ^ self.hash_f
+    }
+
+    /// Number of directory entries (`.` and `..` excluded) in the snapshot.
+    #[inline]
+    pub fn dirs(&self) -> usize {
+        self.dirs
+    }
+
+    /// Number of non-directory entries in the snapshot, those of
+    /// undeterminable type included.
+    #[inline]
+    pub fn files(&self) -> usize {
+        self.files
+    }
+
+    /**
+    Stable combined digest of the directory entries: the same set of
+    `(name, inode, type)` always folds to the same value, in any `readdir`
+    order and across processes (see `doc/design/state-tracking.md` for
+    the scheme and its version boundaries). A fingerprint, not a
+    cryptographic commitment.
+    */
+    #[inline]
+    pub fn hash_dirs(&self) -> u64 {
+        self.hash_d
+    }
+
+    /// Stable combined digest of the non-directory entries; see `hash_dirs()`.
+    #[inline]
+    pub fn hash_files(&self) -> u64 {
+        self.hash_f
+    }
+
+    /**
+    When the snapshot was taken: the start of the pass that produced it,
+    before its first `readdir`. `None` for a never-populated state, i.e.
+    one that holds no snapshot at all.
+    */
+    #[inline]
+    pub fn when(&self) -> Option<TimeSinceEpoch> {
+        self.when
+    }
+
+    /// Whether this state holds a snapshot (a complete pass has produced it).
+    #[inline]
+    pub fn is_populated(&self) -> bool {
+        self.when.is_some()
     }
 }
 

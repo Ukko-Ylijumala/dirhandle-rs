@@ -13,6 +13,8 @@ Each `DirHandle` carries a `DirectoryState` snapshot:
 
 `when` and `stamp` participate in neither `PartialEq` nor `Hash` — two snapshots with identical content compare (and hash) equal regardless of when they were taken.
 
+The content fields are readable through `dirs()`, `files()`, `hash_dirs()`, `hash_files()` (plus the combined `hash_all()`), and the snapshot time through `when()` / `is_populated()`; `stamp` stays internal to the `state_changed_fast()` pre-check. The digests are stable across processes by design, so a caller can store them and compare against a later run.
+
 ## When state is computed
 
 State population is **lazy and one-shot per handle** by default. `DirHandleIter::new` enables its `update` flag only when `state.when.is_none()` — i.e., the very first time the handle is iterated. Subsequent calls to `iter()` do **not** refresh the state, even if the directory has changed externally. Only a clean, complete pass finalises the state: early drops and `readdir` errors skip the update. `iter_untracked()` passes never do (they neither take the directory stamp nor digest the entries), so a handle iterated only that way keeps an empty `DirectoryState` until a tracked pass or `state_changed()` establishes one.
@@ -35,6 +37,8 @@ Both `stamp` and `when` are taken at the *start* of the pass. A change that land
 This is a deliberate trade-off: most callers iterate to consume entries, not to recompute hashes on every pass. If you add a new iteration entry point, decide explicitly whether it should participate in state tracking and follow the existing pattern.
 
 ## StateChange enum
+
+`StateChange` is `Copy`, `Eq` and `Hash`, so a result compares directly against `StateChange::FileNum(1)` and the like.
 
 `DirectoryState::change(&other)` returns the first detected difference, in order:
 
