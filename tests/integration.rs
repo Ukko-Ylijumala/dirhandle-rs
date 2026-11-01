@@ -5,14 +5,14 @@
 
 use dirhandle::{
     birth_time, fstatx, open_regular_at, open_regular_statx_at, partition_dirs_first, path_fd_at, path_fd_beneath,
-    statx_at, DirHandle, DirectoryState, EntryExt, OpenHandles, StateChange, STATX_WITH_BTIME,
+    statx_at, DirHandle, DirectoryState, EntryExt, EntryOwned, OpenHandles, StateChange, STATX_WITH_BTIME,
 };
 use std::collections::hash_map::DefaultHasher;
 use std::ffi::{CString, OsStr};
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::io::{ErrorKind, Read};
-use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -784,6 +784,44 @@ fn try_clone_and_lookup() {
     let listed: EntryExt = twin.iter().find(|l| l.name_as_bytes() == b"plain.txt").unwrap();
     assert_eq!((listed.ino(), listed.file_type()), (e.ino(), e.file_type()));
     assert_eq!(listed.typenum(), e.typenum());
+}
+
+#[test]
+fn detached_entries_outlive_the_handle() {
+    let td = TestDir::new("detach");
+    td.file("b.txt", b"bb");
+    td.file("a.txt", b"a");
+    td.subdir("sub");
+
+    // the listing survives the handle: an owned, sortable, sendable Vec
+    let (owned, path_fd): (Vec<EntryOwned>, OwnedFd) = {
+        let mut h = DirHandle::new(td.path()).unwrap();
+        let v: Vec<EntryOwned> = h.iter_stat().map(EntryExt::into_detached).collect();
+        (v, h.path_fd().unwrap())
+    };
+    fn assert_send_sync<T: Send + Sync + 'static>(_: &T) {}
+    assert_send_sync(&owned);
+    let mut sorted: Vec<EntryOwned> = owned.clone();
+    sorted.sort();
+    let names: Vec<String> = sorted.iter().map(EntryOwned::name).collect();
+    assert_eq!(names, ["a.txt", "b.txt", "sub"]);
+    assert_eq!(sorted.iter().filter(|e| e.is_dir()).count(), 1);
+    let b: &EntryOwned = sorted.iter().find(|e| e.name_as_bytes() == b"b.txt").unwrap();
+    assert!(b.is_statted(), "iter_stat's stat travels with the entry");
+    assert_eq!(b.len(), 2);
+    assert_eq!(b.path_in(td.path()), td.path().join("b.txt"));
+    assert_eq!(b.file_name_os().as_bytes(), b"b.txt");
+
+    // in another thread, and attached to a directory fd again for an open
+    let moved: EntryOwned = b.clone();
+    let len: u64 = std::thread::spawn(move || {
+        let e: EntryExt = moved.attach(path_fd.as_fd());
+        let (_, st) = e.open_regular().unwrap();
+        st.st_size as u64
+    })
+    .join()
+    .unwrap();
+    assert_eq!(len, 2);
 }
 
 #[test]

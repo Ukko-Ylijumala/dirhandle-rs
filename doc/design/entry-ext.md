@@ -33,6 +33,14 @@ Collecting into a `Vec` keeps the mutable borrow on the `DirHandle` alive for th
 
 This replaces an earlier design in which `EntryExt` held a cloned `DirFd` (independent `AtomicI32` snapshot), allowing zombie entries to survive past `DirHandle::drop` and silently issue `fstatat`/`openat2` against closed or reused fds.
 
+## Detached entries (`EntryOwned`)
+
+`EntryOwned` is an `EntryExt` without the `BorrowedFd<'h>`: the same `name`, `ino`, `d_type` and `OnceLock` stat fields, so `detach()` / `into_detached()` is a field move and `attach(dirfd)` is the reverse. It is `Send + Sync + 'static`, which is what lets a listing outlive the handle (a `Vec<EntryOwned>` handed to another thread, kept in a tree, compared with a later listing). What it cannot do is fetch anything: there is no fd to `fstatat` against, so `stat_ref()` answers from the cache alone, and `file_type()` falls back to that cache rather than to a syscall - an entry that was never statted and has no `d_type` is of unknown type for good. Stat before detaching (`iter_stat()`, or `stat()` once) when the size or times will be wanted later.
+
+The fd-independent accessors (`file_name()`, `ino()`, `len()`, `mtime()`, `file_type()`, `typenum()`, `is_dir()`, ...) are defined once, in the `entry_accessors!` macro, for both types; they are all written against `stat_ref()`, which is the only method that differs (lazy on the borrowed entry, cache-only on the detached one). Keep new fd-free accessors in the macro and fd-using ones (`open*`, `read_link()`, `path()`, `stat_refresh()`) on `EntryExt` alone.
+
+`EntryOwned`'s `Eq` / `Ord` / `Hash` are over `(name, inode)` - `EntryExt`'s minus the dirfd - and `xxh3_digest()` goes through the same `entry_digest()` helper, so a detached entry digests to the same value as the borrowed one it came from.
+
 ## Cached stat
 
 The entry holds an `OnceLock<Option<Box<libc::stat>>>`. `stat()` initialises it lazily (one heap allocation on first use); subsequent calls return the cached value. `stat_ref()` is the same cache by reference, without the 144-byte copy, and every field accessor (`len()`, `mode()`, `uid()`, `mtime()`, ...) goes through it. `stat_refresh()` clears the lock and re-stats. The `Option` inside the lock means "we already tried and failed" is cached too — repeated stat failures do not retrigger the syscall.

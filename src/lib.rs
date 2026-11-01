@@ -416,6 +416,218 @@ impl EntryName {
 }
 
 /**
+The accessors an entry has with or without its directory fd, written
+once for [EntryExt] and [EntryOwned]: both keep the same `name`, `ino`,
+`d_type` and `stat` fields and differ only in `stat_ref()` - filled by
+`fstatat` on first use on the borrowed entry, answered from the cache
+alone on the detached one - which everything stat-derived here goes
+through.
+*/
+macro_rules! entry_accessors {
+    () => {
+        /// The entry name exactly as `readdir` returned it (no allocation).
+        #[inline]
+        pub fn file_name(&self) -> &CStr {
+            self.name.as_cstr()
+        }
+
+        /// Inode number of the entry.
+        #[inline]
+        pub fn ino(&self) -> u64 {
+            self.ino
+        }
+
+        /**
+        File type as reported by `readdir` (`dirent.d_type`), **without**
+        the stat fallback that `file_type()` applies. `None` means the
+        filesystem reported `DT_UNKNOWN`.
+        */
+        #[inline]
+        pub fn d_type(&self) -> Option<Type> {
+            self.d_type
+        }
+
+        /// The [libc::stat] of the entry, a copy of the cached one: see
+        /// `stat_ref()`. `None` if the entry cannot be stat()ed.
+        pub fn stat(&self) -> Option<libc::stat> {
+            self.stat_ref().copied()
+        }
+
+        /// Whether the entry has been statted (successfully or not).
+        pub fn is_statted(&self) -> bool {
+            self.stat.get().is_some()
+        }
+
+        /**
+        Return the size of the file, in bytes.
+
+        Note that the size is returned as a `u64` to match the
+        [std::fs::Metadata] API, even though the underlying [libc::stat]
+        struct uses `i64` for the size. Also, if for some reason we cannot
+        stat() the file, we return `0`.
+        */
+        pub fn len(&self) -> u64 {
+            match self.stat_ref() {
+                Some(stat) => stat.st_size as u64,
+                None => 0,
+            }
+        }
+
+        /// Return the mode of the file as a [libc::mode_t] value (`u32`).
+        pub fn mode(&self) -> Option<libc::mode_t> {
+            self.stat_ref().map(|s: &libc::stat| s.st_mode)
+        }
+
+        /**
+        Device (`st_dev`) of the filesystem the entry is on, if it can be
+        stat()ed. With `ino()` the entry's identity across directories: two
+        entries with the same `(dev, ino)` are the same inode (hard links),
+        and a `dev` other than the directory's own marks a mount point.
+        */
+        pub fn dev(&self) -> Option<libc::dev_t> {
+            self.stat_ref().map(|s: &libc::stat| s.st_dev)
+        }
+
+        /// Whether the entry is a zero-length file (or stat() failed; see `len()`).
+        #[inline]
+        pub fn is_empty(&self) -> bool {
+            self.len() == 0
+        }
+
+        /// Owner uid of the entry, if it can be stat()ed.
+        pub fn uid(&self) -> Option<libc::uid_t> {
+            self.stat_ref().map(|s: &libc::stat| s.st_uid)
+        }
+
+        /// Owner gid of the entry, if it can be stat()ed.
+        pub fn gid(&self) -> Option<libc::gid_t> {
+            self.stat_ref().map(|s: &libc::stat| s.st_gid)
+        }
+
+        /// Number of hard links to the entry, if it can be stat()ed.
+        // `nlink_t` is u64 on x86_64 but u32 on e.g. aarch64; `From` covers both,
+        // and on the former clippy sees an identity conversion - by design.
+        #[allow(clippy::useless_conversion)]
+        pub fn nlink(&self) -> Option<u64> {
+            self.stat_ref().map(|s: &libc::stat| u64::from(s.st_nlink))
+        }
+
+        /**
+        Last modification time of the entry, if it can be stat()ed.
+
+        NOTE: [TimeSinceEpoch] is `f64` seconds - roughly microsecond
+        precision in the current era. Use `stat()` directly if you need the
+        exact nanosecond timespec.
+        */
+        pub fn mtime(&self) -> Option<TimeSinceEpoch> {
+            self.stat_ref().map(|s: &libc::stat| stat_time(s.st_mtime, s.st_mtime_nsec))
+        }
+
+        /// Last access time of the entry, if it can be stat()ed. See `mtime()`
+        /// for the precision caveat.
+        pub fn atime(&self) -> Option<TimeSinceEpoch> {
+            self.stat_ref().map(|s: &libc::stat| stat_time(s.st_atime, s.st_atime_nsec))
+        }
+
+        /// Last status (inode) change time of the entry, if it can be stat()ed.
+        /// See `mtime()` for the precision caveat.
+        pub fn ctime(&self) -> Option<TimeSinceEpoch> {
+            self.stat_ref().map(|s: &libc::stat| stat_time(s.st_ctime, s.st_ctime_nsec))
+        }
+
+        /// The entry name as raw bytes, without the trailing NUL (no allocation).
+        #[inline]
+        pub fn name_as_bytes(&self) -> &[u8] {
+            self.name.as_bytes()
+        }
+        /// The entry name as an [OsStr] (no allocation): what [Path::join] and
+        /// the `std::fs` functions take, non-UTF-8 names included.
+        #[inline]
+        pub fn file_name_os(&self) -> &OsStr {
+            OsStr::from_bytes(self.name_as_bytes())
+        }
+        /// Lossily converts the original `Cstr` entry name to a `String`.
+        /// If you need the original name, use `file_name()` instead.
+        #[inline]
+        pub fn name(&self) -> String {
+            self.file_name().to_string_lossy().into_owned()
+        }
+
+        /**
+        The entry's path below `dir`, the path of the directory it was listed
+        in: a plain join, nothing is checked. For a walker that knows where
+        it is - `EntryExt::path()` resolves the directory through procfs
+        instead (a `readlink`, an `fstat` and two allocations per call).
+        */
+        pub fn path_in(&self, dir: &Path) -> PathBuf {
+            dir.join(self.file_name_os())
+        }
+
+        /// Return the file type of the entry as a [nix::dir::Type] enum,
+        /// falling back to the stat (see `stat_ref()`) when `d_type` is `DT_UNKNOWN`.
+        pub fn file_type(&self) -> Option<Type> {
+            if let Some(entry_type) = self.d_type {
+                Some(entry_type)
+            } else {
+                match self.mode() {
+                    Some(mode) => EntryType(mode).entry_t(),
+                    None => None, // couldn't stat the entry
+                }
+            }
+        }
+
+        /**
+        Return the file type of the entry as a `u8` typenum: the kernel's
+        `DT_*` value (see the `TYPENUM_*` constants). This is part of the
+        stable state digest, so it is an explicit mapping rather than nix's
+        enum discriminant. Unknown is [TYPENUM_UNKNOWN] (`DT_UNKNOWN`).
+        */
+        #[rustfmt::skip]
+        pub fn typenum(&self) -> u8 {
+            match self.file_type() {
+                Some(Type::Fifo)            => TYPENUM_FIFO,
+                Some(Type::CharacterDevice) => TYPENUM_CHR,
+                Some(Type::Directory)       => TYPENUM_DIR,
+                Some(Type::BlockDevice)     => TYPENUM_BLK,
+                Some(Type::File)            => TYPENUM_REG,
+                Some(Type::Symlink)         => TYPENUM_LNK,
+                Some(Type::Socket)          => TYPENUM_SOCK,
+                None                        => TYPENUM_UNKNOWN,
+            }
+        }
+
+        #[inline]
+        pub fn is_file(&self) -> bool {
+            matches!(self.file_type(), Some(Type::File))
+        }
+        #[inline]
+        pub fn is_dir(&self) -> bool {
+            matches!(self.file_type(), Some(Type::Directory))
+        }
+        #[inline]
+        pub fn is_symlink(&self) -> bool {
+            matches!(self.file_type(), Some(Type::Symlink))
+        }
+        #[inline]
+        pub fn is_block(&self) -> bool {
+            matches!(self.file_type(), Some(Type::BlockDevice))
+        }
+        #[inline]
+        pub fn is_char(&self) -> bool {
+            matches!(self.file_type(), Some(Type::CharacterDevice))
+        }
+        #[inline]
+        pub fn is_sock(&self) -> bool {
+            matches!(self.file_type(), Some(Type::Socket))
+        }
+        #[inline]
+        pub fn is_fifo(&self) -> bool {
+            matches!(self.file_type(), Some(Type::Fifo))
+        }
+    };
+}
+
+/**
 A directory entry, aiming to be closely compatible with the
 [std::fs::DirEntry] API. Built from a [nix::dir::Entry] but does **not**
 keep one: the name (inline when short), the inode and `d_type` are copied
@@ -489,41 +701,14 @@ impl<'h> EntryExt<'h> {
         new_e
     }
 
-    /// The entry name exactly as `readdir` returned it (no allocation).
-    #[inline]
-    pub fn file_name(&self) -> &CStr {
-        self.name.as_cstr()
-    }
-
-    /// Inode number of the entry.
-    #[inline]
-    pub fn ino(&self) -> u64 {
-        self.ino
-    }
+    entry_accessors!();
 
     /**
-    File type as reported by `readdir` (`dirent.d_type`), **without** the
-    `fstatat` fallback that `file_type()` applies. `None` means the
-    filesystem reported `DT_UNKNOWN`.
-    */
-    #[inline]
-    pub fn d_type(&self) -> Option<Type> {
-        self.d_type
-    }
-
-    /**
-    Return the [libc::stat] struct for the entry (may be cached).
-
-    NOTE: If for some reason we cannot stat the entry, we return `None`.
-    */
-    pub fn stat(&self) -> Option<libc::stat> {
-        self.stat_ref().copied()
-    }
-
-    /**
-    The cached [libc::stat] of the entry by reference: `stat()` without
+    The cached [libc::stat] of the entry by reference, taken with one
+    `fstatat` (never following a symlink) on first use: `stat()` without
     the 144-byte copy, for reading a field or two. Every field accessor
-    below goes through this. `None` if the entry cannot be stat()ed.
+    goes through this. `None` if the entry cannot be stat()ed - cached as
+    well, so a failing stat is not retried.
     */
     pub fn stat_ref(&self) -> Option<&libc::stat> {
         self.stat
@@ -539,87 +724,6 @@ impl<'h> EntryExt<'h> {
     pub fn stat_refresh(&mut self) -> Option<libc::stat> {
         self.stat.take();
         self.stat()
-    }
-
-    /// Whether the entry has been statted.
-    pub fn is_statted(&self) -> bool {
-        self.stat.get().is_some()
-    }
-
-    /**
-    Return the size of the file, in bytes.
-
-    Note that the size is returned as a `u64` to match the [std::fs::Metadata]
-    API, even though the underlying [libc::stat] struct uses `i64` for the size.
-    Also, if for some reason we cannot stat() the file, we return `0`.
-    */
-    pub fn len(&self) -> u64 {
-        match self.stat_ref() {
-            Some(stat) => stat.st_size as u64,
-            None => 0,
-        }
-    }
-
-    /// Return the mode of the file as a [libc::mode_t] value (`u32`).
-    pub fn mode(&self) -> Option<libc::mode_t> {
-        self.stat_ref().map(|s: &libc::stat| s.st_mode)
-    }
-
-    /**
-    Device (`st_dev`) of the filesystem the entry is on, if it can be
-    stat()ed. With `ino()` the entry's identity across directories: two
-    entries with the same `(dev, ino)` are the same inode (hard links),
-    and a `dev` other than the directory's own marks a mount point.
-    */
-    pub fn dev(&self) -> Option<libc::dev_t> {
-        self.stat_ref().map(|s: &libc::stat| s.st_dev)
-    }
-
-    /// Whether the entry is a zero-length file (or stat() failed; see `len()`).
-    #[inline]
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
-    /// Owner uid of the entry, if it can be stat()ed.
-    pub fn uid(&self) -> Option<libc::uid_t> {
-        self.stat_ref().map(|s: &libc::stat| s.st_uid)
-    }
-
-    /// Owner gid of the entry, if it can be stat()ed.
-    pub fn gid(&self) -> Option<libc::gid_t> {
-        self.stat_ref().map(|s: &libc::stat| s.st_gid)
-    }
-
-    /// Number of hard links to the entry, if it can be stat()ed.
-    // `nlink_t` is u64 on x86_64 but u32 on e.g. aarch64; `From` covers both,
-    // and on the former clippy sees an identity conversion - by design.
-    #[allow(clippy::useless_conversion)]
-    pub fn nlink(&self) -> Option<u64> {
-        self.stat_ref().map(|s: &libc::stat| u64::from(s.st_nlink))
-    }
-
-    /**
-    Last modification time of the entry, if it can be stat()ed.
-
-    NOTE: [TimeSinceEpoch] is `f64` seconds - roughly microsecond
-    precision in the current era. Use `stat()` directly if you need the
-    exact nanosecond timespec.
-    */
-    pub fn mtime(&self) -> Option<TimeSinceEpoch> {
-        self.stat_ref().map(|s: &libc::stat| stat_time(s.st_mtime, s.st_mtime_nsec))
-    }
-
-    /// Last access time of the entry, if it can be stat()ed. See `mtime()`
-    /// for the precision caveat.
-    pub fn atime(&self) -> Option<TimeSinceEpoch> {
-        self.stat_ref().map(|s: &libc::stat| stat_time(s.st_atime, s.st_atime_nsec))
-    }
-
-    /// Last status (inode) change time of the entry, if it can be stat()ed.
-    /// See `mtime()` for the precision caveat.
-    pub fn ctime(&self) -> Option<TimeSinceEpoch> {
-        self.stat_ref().map(|s: &libc::stat| stat_time(s.st_ctime, s.st_ctime_nsec))
     }
 
     /// Open this entry as a [std::fs::File] with the given flags, beneath its directory.
@@ -723,24 +827,6 @@ impl<'h> EntryExt<'h> {
         DirHandle::open_at(self.dirfd, self.file_name())
     }
 
-    /// The entry name as raw bytes, without the trailing NUL (no allocation).
-    #[inline]
-    pub fn name_as_bytes(&self) -> &[u8] {
-        self.name.as_bytes()
-    }
-    /// The entry name as an [OsStr] (no allocation): what [Path::join] and
-    /// the `std::fs` functions take, non-UTF-8 names included.
-    #[inline]
-    pub fn file_name_os(&self) -> &OsStr {
-        OsStr::from_bytes(self.name_as_bytes())
-    }
-    /// Lossily converts the original `Cstr` entry name to a `String`.
-    /// If you need the original name, use `file_name()` instead.
-    #[inline]
-    pub fn name(&self) -> String {
-        self.file_name().to_string_lossy().into_owned()
-    }
-
     /**
     This relies on proc filesystem being available due to the use of
     `/proc/self/fd` to resolve the parent directory by file descriptor.
@@ -755,75 +841,24 @@ impl<'h> EntryExt<'h> {
     }
 
     /**
-    The entry's path below `dir`, the path of the directory it was listed
-    in: `path()` without the procfs round trip (a `readlink`, an `fstat`
-    and two allocations per call), for a walker that knows where it is.
-    Nothing is checked - the result is a plain join.
+    This entry without its directory fd, as an [EntryOwned] that outlives
+    the handle: the name, inode and `d_type`, and the stat as cached so
+    far (if any; stat first for an entry whose size or times will be
+    wanted later, since the detached entry can fetch nothing more).
+    `into_detached()` moves instead of cloning.
     */
-    pub fn path_in(&self, dir: &Path) -> PathBuf {
-        dir.join(self.file_name_os())
+    pub fn detach(&self) -> EntryOwned {
+        self.clone().into_detached()
     }
 
-    /// Return the file type of the entry as a [nix::dir::Type] enum,
-    /// falling back to `stat()` when `d_type` is `DT_UNKNOWN`.
-    pub fn file_type(&self) -> Option<Type> {
-        if let Some(entry_type) = self.d_type {
-            Some(entry_type)
-        } else {
-            match self.mode() {
-                Some(mode) => EntryType(mode).entry_t(),
-                None => None, // couldn't stat the entry
-            }
+    /// [Self::detach], consuming the entry (no clone of the name or stat).
+    pub fn into_detached(self) -> EntryOwned {
+        EntryOwned {
+            name: self.name,
+            ino: self.ino,
+            d_type: self.d_type,
+            stat: self.stat,
         }
-    }
-
-    /**
-    Return the file type of the entry as a `u8` typenum: the kernel's
-    `DT_*` value (see the `TYPENUM_*` constants). This is part of the
-    stable state digest, so it is an explicit mapping rather than nix's
-    enum discriminant. Unknown is [TYPENUM_UNKNOWN] (`DT_UNKNOWN`).
-    */
-    #[rustfmt::skip]
-    pub fn typenum(&self) -> u8 {
-        match self.file_type() {
-            Some(Type::Fifo)            => TYPENUM_FIFO,
-            Some(Type::CharacterDevice) => TYPENUM_CHR,
-            Some(Type::Directory)       => TYPENUM_DIR,
-            Some(Type::BlockDevice)     => TYPENUM_BLK,
-            Some(Type::File)            => TYPENUM_REG,
-            Some(Type::Symlink)         => TYPENUM_LNK,
-            Some(Type::Socket)          => TYPENUM_SOCK,
-            None                        => TYPENUM_UNKNOWN,
-        }
-    }
-
-    #[inline]
-    pub fn is_file(&self) -> bool {
-        matches!(self.file_type(), Some(Type::File))
-    }
-    #[inline]
-    pub fn is_dir(&self) -> bool {
-        matches!(self.file_type(), Some(Type::Directory))
-    }
-    #[inline]
-    pub fn is_symlink(&self) -> bool {
-        matches!(self.file_type(), Some(Type::Symlink))
-    }
-    #[inline]
-    pub fn is_block(&self) -> bool {
-        matches!(self.file_type(), Some(Type::BlockDevice))
-    }
-    #[inline]
-    pub fn is_char(&self) -> bool {
-        matches!(self.file_type(), Some(Type::CharacterDevice))
-    }
-    #[inline]
-    pub fn is_sock(&self) -> bool {
-        matches!(self.file_type(), Some(Type::Socket))
-    }
-    #[inline]
-    pub fn is_fifo(&self) -> bool {
-        matches!(self.file_type(), Some(Type::Fifo))
     }
 }
 
@@ -888,9 +923,7 @@ impl<'h> Hash for EntryExt<'h> {
 
 impl<'h> Xxh3Hashable for EntryExt<'h> {
     fn xxh3<H: Hasher>(&self, state: &mut H) {
-        state.write(self.name_as_bytes());
-        state.write_u64(self.ino);
-        state.write_u8(self.typenum());
+        entry_xxh3(state, self.name_as_bytes(), self.ino, self.typenum());
     }
 
     /**
@@ -912,10 +945,132 @@ impl<'h> Xxh3Hashable for EntryExt<'h> {
     */
     #[inline]
     fn xxh3_digest(&self) -> u64 {
-        let mut hasher: QuickXxh3Hasher = QuickXxh3Hasher::new();
-        hasher.write_u64(hash_bytes(self.name_as_bytes()) ^ self.typenum() as u64);
-        hasher.write_u64(self.ino);
-        hasher.finish()
+        entry_digest(self.name_as_bytes(), self.ino, self.typenum())
+    }
+}
+
+/// The streaming `xxh3()` of an entry, borrowed or detached.
+#[inline]
+fn entry_xxh3<H: Hasher>(state: &mut H, name: &[u8], ino: u64, typenum: u8) {
+    state.write(name);
+    state.write_u64(ino);
+    state.write_u8(typenum);
+}
+
+/// The one-shot `xxh3_digest()` of an entry, borrowed or detached: the
+/// scheme is described on [EntryExt]'s [Xxh3Hashable] impl.
+#[inline]
+fn entry_digest(name: &[u8], ino: u64, typenum: u8) -> u64 {
+    let mut hasher: QuickXxh3Hasher = QuickXxh3Hasher::new();
+    hasher.write_u64(hash_bytes(name) ^ typenum as u64);
+    hasher.write_u64(ino);
+    hasher.finish()
+}
+
+/* --------------------------------- */
+
+/**
+An entry detached from its directory: [EntryExt] without the borrowed
+directory fd, so it can outlive the handle that listed it - sent to
+another thread, kept in a tree, compared with a later listing. It
+carries what the listing gave (name, inode, `d_type`) and the stat that
+was cached when it was detached, if one was taken; nothing more can be
+fetched, as there is no directory to `fstatat` against: `stat_ref()` and
+the accessors answer from that cache alone, and `file_type()` falls back
+to it rather than to a syscall. `attach(dirfd)` makes it an [EntryExt]
+of a directory fd again (an `O_PATH` fd from `path_fd()`, say), cache
+intact, with the opens and the lazy stat back.
+
+Equality, ordering and hashing are over `(name, inode)` - what
+[EntryExt] uses, minus the dirfd - and `xxh3_digest()` is the same value
+as the borrowed entry's, so a detached listing can be digested too.
+*/
+#[derive(Clone)]
+pub struct EntryOwned {
+    name: EntryName,
+    ino: u64,
+    /// `d_type` as reported by `readdir`; `None` when `DT_UNKNOWN`
+    d_type: Option<Type>,
+    /// the stat cached at detach time; `Some(None)` = it had failed
+    stat: OnceLock<Option<Box<libc::stat>>>,
+}
+
+impl EntryOwned {
+    entry_accessors!();
+
+    /// The [libc::stat] cached when the entry was detached, by reference.
+    /// `None` if none was taken by then, or if that stat had failed.
+    pub fn stat_ref(&self) -> Option<&libc::stat> {
+        self.stat.get().and_then(Option::as_deref)
+    }
+
+    /// Back to an [EntryExt] of the directory `dirfd` (which must be the
+    /// directory the entry was listed in, for its name to mean the same).
+    pub fn attach<'h>(self, dirfd: BorrowedFd<'h>) -> EntryExt<'h> {
+        EntryExt {
+            name: self.name,
+            ino: self.ino,
+            d_type: self.d_type,
+            dirfd,
+            stat: self.stat,
+        }
+    }
+}
+
+impl Eq for EntryOwned {}
+
+impl PartialEq for EntryOwned {
+    fn eq(&self, other: &Self) -> bool {
+        self.name_as_bytes() == other.name_as_bytes() && self.ino == other.ino
+    }
+}
+
+impl Ord for EntryOwned {
+    /// By name, inode as the tie-breaker: consistent with [PartialEq].
+    #[inline]
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.name_as_bytes()
+            .cmp(other.name_as_bytes())
+            .then_with(|| self.ino.cmp(&other.ino))
+    }
+}
+
+impl PartialOrd for EntryOwned {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Hash for EntryOwned {
+    /// `(name, inode)`: the same fields as [EntryExt] hashes.
+    #[inline]
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.name_as_bytes().hash(state);
+        self.ino.hash(state);
+    }
+}
+
+impl Xxh3Hashable for EntryOwned {
+    fn xxh3<H: Hasher>(&self, state: &mut H) {
+        entry_xxh3(state, self.name_as_bytes(), self.ino, self.typenum());
+    }
+
+    /// The same value as the borrowed entry's: see [EntryExt]'s impl.
+    #[inline]
+    fn xxh3_digest(&self) -> u64 {
+        entry_digest(self.name_as_bytes(), self.ino, self.typenum())
+    }
+}
+
+impl Debug for EntryOwned {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct("EntryOwned")
+            .field("name", &self.file_name())
+            .field("ino", &self.ino)
+            .field("d_type", &self.d_type)
+            // None: never statted; Some(false): the stat had failed
+            .field("statted", &self.stat.get().map(Option::is_some))
+            .finish()
     }
 }
 
@@ -2930,10 +3085,61 @@ mod tests {
     }
 
     #[test]
+    fn detached_entry_keeps_cache_and_digest_but_fetches_nothing() {
+        let dir: PathBuf = std::env::temp_dir()
+            .join(format!("dirhandle-unit-{}-detach", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("plain"), b"xyz").unwrap();
+
+        let h = DirHandle::new(&dir).unwrap();
+        let e: EntryExt = h.lookup("plain").unwrap();
+        // without d_type and without a cached stat, a detached entry has no type
+        let untyped = EntryExt { d_type: None, stat: OnceLock::new(), ..e.clone() };
+        let bare: EntryOwned = untyped.detach();
+        assert!(!bare.is_statted());
+        assert_eq!(bare.file_type(), None, "no fd to fstatat against");
+        assert_eq!(bare.len(), 0);
+        assert_eq!(bare.typenum(), TYPENUM_UNKNOWN);
+        // the borrowed entry can still stat, and a detach then carries it
+        assert_eq!(untyped.file_type(), Some(Type::File));
+        let statted: EntryOwned = untyped.detach();
+        assert!(statted.is_statted());
+        assert_eq!(statted.file_type(), Some(Type::File));
+        assert_eq!(statted.len(), 3);
+        assert_eq!(statted.dev(), e.dev());
+        // identity, digest and the stable hash agree with the borrowed entry
+        assert_eq!(statted.xxh3_digest(), e.xxh3_digest());
+        assert_eq!(siphash(&statted), siphash(&e));
+        assert_eq!((statted.name_as_bytes(), statted.ino()), (e.name_as_bytes(), e.ino()));
+        assert_eq!(bare, statted, "equality is over (name, ino) alone");
+        // a failed stat is carried as such, not retried
+        let ghost = EntryExt {
+            name: EntryName::new(c"does-not-exist"),
+            ino: 0,
+            d_type: None,
+            dirfd: h.inner.as_fd(),
+            stat: OnceLock::new(),
+        };
+        assert_eq!(ghost.stat(), None);
+        let ghost: EntryOwned = ghost.into_detached();
+        assert!(ghost.is_statted());
+        assert_eq!(ghost.stat_ref(), None);
+        // attached again, the entry opens and stats as before
+        let back: EntryExt = statted.attach(h.inner.as_fd());
+        assert_eq!(back, e);
+        assert_eq!(back.read().unwrap().metadata().unwrap().len(), 3);
+
+        drop(h);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn entry_ext_is_compact() {
         // the whole point of v0.5.0's EntryExt: ~80 bytes, not ~440
         assert_eq!(std::mem::size_of::<EntryName>(), 48);
         assert!(std::mem::size_of::<EntryExt>() <= 80, "{}", std::mem::size_of::<EntryExt>());
+        assert!(std::mem::size_of::<EntryOwned>() <= 80, "{}", std::mem::size_of::<EntryOwned>());
     }
 
     #[test]
