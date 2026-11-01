@@ -68,11 +68,9 @@ dirhandle = { git = "https://github.com/Ukko-Ylijumala/dirhandle-rs", features =
 ### Open a directory and iterate
 
 ```rust
-use std::path::Path;
 use dirhandle::DirHandle;
 
-let path = Path::new("/some/directory");
-let mut handle = DirHandle::new(path).expect("Failed to open directory");
+let mut handle = DirHandle::new("/some/directory").expect("Failed to open directory");
 
 for entry in handle.iter() {
     println!("Found: {}", entry.name());
@@ -94,11 +92,10 @@ if handle.state_changed()? {
 ### Manage many handles concurrently
 
 ```rust
-use std::path::Path;
 use dirhandle::OpenHandles;
 
 let handles = OpenHandles::new();
-if let Ok(mut handle) = handles.open(Path::new("/some/directory")) {
+if let Ok(mut handle) = handles.open("/some/directory") {
     for entry in handle.iter_sorted() {
         println!("Sorted entry: {}", entry.name());
     }

@@ -110,6 +110,15 @@ fn path_resolution_via_procfs() {
     let p: PathBuf = h.path().expect("path() must work with procfs mounted");
     assert_eq!(p, td.path().canonicalize().unwrap());
 
+    // anything path-like opens: &str, &PathBuf, PathBuf, &OsStr
+    let s: &str = td.path().to_str().unwrap();
+    let owned: PathBuf = td.path().to_path_buf();
+    assert_eq!(DirHandle::new(s).unwrap().path().unwrap(), p);
+    assert_eq!(DirHandle::new(&owned).unwrap().path().unwrap(), p);
+    assert_eq!(DirHandle::new(owned).unwrap().path().unwrap(), p);
+    assert_eq!(DirHandle::new(td.path().as_os_str()).unwrap().path().unwrap(), p);
+    assert_eq!(OpenHandles::new().open(s).unwrap().path().unwrap(), p);
+
     for e in h.iter() {
         let ep: PathBuf = e.path().expect("entry path() must resolve");
         assert!(ep.symlink_metadata().is_ok(), "bad entry path {ep:?}");
@@ -687,7 +696,7 @@ fn open_beneath_resolves_past_path_max() {
     // a chain of directories no single path can name
     let rel: PathBuf = mkdir_chain(&root, &"d".repeat(200), 30);
     assert!(rel.as_os_str().len() > libc::PATH_MAX as usize);
-    let err = DirHandle::new(&td.path().join(&rel)).expect_err("ENAMETOOLONG expected");
+    let err = DirHandle::new(td.path().join(&rel)).expect_err("ENAMETOOLONG expected");
     assert_eq!(err.raw_os_error(), Some(libc::ENAMETOOLONG), "{err}");
     let mut deep = DirHandle::open_beneath(&root, &rel).expect("open past PATH_MAX");
     let names: Vec<String> = deep.iter().map(|e| e.name()).collect();

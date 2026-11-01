@@ -1219,10 +1219,11 @@ pub struct DirHandle {
 }
 
 impl DirHandle {
-    /// Open a directory by path and return its handle object.
-    #[instrument(level = "trace")]
-    pub fn new(path: &Path) -> io::Result<Self> {
-        Ok(Self::from_dir(get_dir_handle(path)?))
+    /// Open a directory by path (anything path-like: `&str`, `&Path`,
+    /// `PathBuf`, `&OsStr`) and return its handle object.
+    #[instrument(level = "trace", skip(path), fields(path = ?path.as_ref()))]
+    pub fn new<P: AsRef<Path>>(path: P) -> io::Result<Self> {
+        Ok(Self::from_dir(get_dir_handle(path.as_ref())?))
     }
 
     /**
@@ -2149,7 +2150,7 @@ impl OpenHandles {
     **NOTE**: may deadlock if called while holding any kind of reference
     into this [OpenHandles] in the same thread.
     */
-    pub fn open(&'_ self, path: &Path) -> io::Result<CheckedOutHandle<'_>> {
+    pub fn open<P: AsRef<Path>>(&'_ self, path: P) -> io::Result<CheckedOutHandle<'_>> {
         Ok(self.adopt(DirHandle::new(path)?))
     }
 
@@ -2907,7 +2908,7 @@ mod tests {
         feeds every stored DirectoryState. Lengths straddle the inline name
         cap, xxh3's 16 / 128 / 240-byte input boundaries and NAME_MAX.
         */
-        let h = DirHandle::new(&std::env::temp_dir()).unwrap();
+        let h = DirHandle::new(std::env::temp_dir()).unwrap();
         let entry = |name: &CStr, ino: u64, d_type: Type| EntryExt {
             name: EntryName::new(name),
             ino,
@@ -3023,7 +3024,7 @@ mod tests {
 
     #[test]
     fn plain_passes_do_not_allocate_the_lookahead_buffer() {
-        let mut h = DirHandle::new(&std::env::temp_dir()).unwrap();
+        let mut h = DirHandle::new(std::env::temp_dir()).unwrap();
         let mut plain: DirHandleIter = DirHandleIter::with_update(&mut h, false, false).plain();
         let _ = plain.by_ref().count();
         assert_eq!(plain.buf.capacity(), 0, "plain mode must never touch the buffer");
