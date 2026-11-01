@@ -22,7 +22,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 The interesting design decisions are split out under `doc/design/`. Read the relevant file before making non-trivial changes to that subsystem:
 
-- [`doc/design/dirfd.md`](doc/design/dirfd.md) — `DirFd`: atomic, sign-encoded fd state machine and its `AsFd` soundness contract.
+- [`doc/design/dirfd.md`](doc/design/dirfd.md) — `DirFd`: atomic, sign-encoded fd state machine, and why it is `AsRawFd` but not `AsFd` (`unsafe fn borrow_fd()` instead).
 - [`doc/design/entry-ext.md`](doc/design/entry-ext.md) — `EntryExt`: `OnceLock` stat caching, `openat2 + RESOLVE_BENEATH`, dual hash protocols.
 - [`doc/design/iteration.md`](doc/design/iteration.md) — `DirHandleIter` lookahead heuristic, rewind semantics, and thread-safety rules.
 - [`doc/design/state-tracking.md`](doc/design/state-tracking.md) — `DirectoryState`, the `StateChange` ordering, and the lazy-population model.

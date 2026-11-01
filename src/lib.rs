@@ -272,8 +272,46 @@ impl DirFd {
         if fd < 0 {
             return Err(io::Error::new(io::ErrorKind::NotFound, "stale file descriptor"));
         }
-        // `fd >= 0` was checked above, so `as_fd()` cannot panic here
-        proc_fd_path(self)
+        proc_fd_path(fd)
+    }
+
+    /**
+    A [BorrowedFd] view of the stored fd, for the `*_at` functions and
+    anything else that wants an fd type rather than a number.
+
+    `DirFd` is not [AsFd] on purpose: a safe `as_fd()` promises that the
+    fd stays open for the whole borrow, and a `DirFd` cannot keep that
+    promise. It is a snapshot of a number that it does not own; whoever
+    does own the fd may close it at any time, and the kernel then reuses
+    the number for the next `open()` anywhere in the process. A borrow
+    that outlived the close would operate on a stranger's file.
+
+    # Safety
+
+    The fd must be open at the call and must stay open for as long as the
+    returned borrow is alive. Hold the owner (the [DirHandle], or the
+    [OpenHandles] checkout) for that long, or know by construction that
+    nothing closes it.
+
+    # Panics
+
+    Panics if the `DirFd` is stale or uninitialized (`is_open()` is false):
+    `BorrowedFd::borrow_raw` forbids `-1`, and the uninit sentinel is no
+    fd at all, so misuse becomes a deterministic panic rather than
+    undefined behaviour. Test `is_open()` first when the state is unknown.
+    */
+    pub unsafe fn borrow_fd(&self) -> BorrowedFd<'_> {
+        let fd: RawFd = self.fd();
+        assert!(
+            fd >= 0,
+            "DirFd::borrow_fd called on closed or uninitialized DirFd (raw: {fd})",
+        );
+        /*
+        SAFETY: `fd >= 0` satisfies `borrow_raw`'s own precondition (never
+        -1). That the fd is open for the borrow's lifetime is the caller's
+        contract, stated above; it is why this function is `unsafe`.
+        */
+        unsafe { BorrowedFd::borrow_raw(fd) }
     }
 }
 
@@ -316,35 +354,6 @@ impl Hash for DirFd {
     #[inline]
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.fd().hash(state);
-    }
-}
-
-impl AsFd for DirFd {
-    /**
-    Returns a [BorrowedFd] view of the stored fd.
-
-    # Panics
-
-    Panics if the `DirFd` is not in the "open" state (`is_open()` returns
-    false). `BorrowedFd::borrow_raw` forbids `-1` and requires the fd to
-    be open for the borrow's lifetime; passing a stale or uninitialized
-    value here would be undefined behaviour, so we choose a deterministic
-    panic over silent UB. Callers that may legitimately hold a closed
-    `DirFd` should test `is_open()` before invoking this method.
-    */
-    fn as_fd(&'_ self) -> BorrowedFd<'_> {
-        let fd: RawFd = self.fd();
-        assert!(
-            fd >= 0,
-            "DirFd::as_fd called on closed or uninitialized DirFd (raw: {fd})",
-        );
-        /*
-        SAFETY: We checked `fd >= 0`, satisfying the minimum precondition of
-        `BorrowedFd::borrow_raw` (which forbids -1). Per-call OS-level
-        openness of the fd remains the caller's responsibility, as documented
-        on the method.
-        */
-        unsafe { BorrowedFd::borrow_raw(fd) }
     }
 }
 
@@ -560,7 +569,7 @@ macro_rules! entry_accessors {
         The entry's path below `dir`, the path of the directory it was listed
         in: a plain join, nothing is checked. For a walker that knows where
         it is - `EntryExt::path()` resolves the directory through procfs
-        instead (a `readlink`, an `fstat` and two allocations per call).
+        instead (a `readlink`, a `statx` and two allocations per call).
         */
         pub fn path_in(&self, dir: &Path) -> PathBuf {
             dir.join(self.file_name_os())
@@ -869,7 +878,7 @@ impl<'h> EntryExt<'h> {
     Fails with `NotFound` if the parent directory has been deleted.
     */
     pub fn path(&self) -> io::Result<PathBuf> {
-        let link: PathBuf = proc_fd_path(self.dirfd)?;
+        let link: PathBuf = proc_fd_path(self.dirfd.as_raw_fd())?;
         Ok(link.join(self.file_name_os()))
     }
 
@@ -1589,7 +1598,7 @@ impl DirHandle {
     the handle itself stays open and iterable (as empty).
     */
     pub fn path(&self) -> io::Result<PathBuf> {
-        proc_fd_path(&self.inner)
+        proc_fd_path(self.inner.as_raw_fd())
     }
 
     /// Stored state of the directory as a [DirectoryState] object.
@@ -2607,9 +2616,12 @@ by link count instead of by string: `rmdir` drops the inode's `st_nlink`
 to 0, which `fstat` on the open fd reports, whereas a directory that is
 merely *named* `"foo (deleted)"` keeps its links. Deleted directories
 therefore fail with `NotFound`.
+
+Takes the bare number so that [DirFd::path] can use it without a
+[BorrowedFd] it could not vouch for; a stale number fails at the
+`readlink` or describes whatever reused the fd, never worse.
 */
-fn proc_fd_path<Fd: AsFd>(fd: Fd) -> io::Result<PathBuf> {
-    let raw: RawFd = fd.as_fd().as_raw_fd();
+fn proc_fd_path(raw: RawFd) -> io::Result<PathBuf> {
     let link: PathBuf = read_link(format!("{}/{}", PROC_FD_PATH, raw)).map_err(|e| {
         if e.kind() == io::ErrorKind::NotFound && !Path::new(PROC_FD_PATH).is_dir() {
             io::Error::new(io::ErrorKind::Unsupported, "procfs not available")
@@ -2617,7 +2629,7 @@ fn proc_fd_path<Fd: AsFd>(fd: Fd) -> io::Result<PathBuf> {
             e
         }
     })?;
-    if fstat(&fd)?.st_nlink == 0 {
+    if statx_raw(raw, c"", libc::AT_EMPTY_PATH, libc::STATX_NLINK)?.stx_nlink == 0 {
         return Err(io::Error::new(io::ErrorKind::NotFound, "directory has been deleted"));
     }
     Ok(link)
@@ -3115,15 +3127,24 @@ mod tests {
         assert_eq!(fd.fd(), dir.as_raw_fd());
         assert!(unsafe { libc::fcntl(fd.fd(), libc::F_GETFD) } >= 0, "fd must stay open");
         assert!(fd.path().is_ok());
+        // `dir` is alive for the whole borrow
+        assert_eq!(unsafe { fd.borrow_fd() }.as_raw_fd(), dir.as_raw_fd());
     }
 
     #[test]
-    fn dirfd_as_fd_panics_when_not_open() {
+    fn dirfd_borrow_fd_panics_when_not_open() {
         let fd = DirFd::default();
         let res = std::panic::catch_unwind(|| {
-            let _ = fd.as_fd();
+            let _ = unsafe { fd.borrow_fd() };
         });
-        assert!(res.is_err(), "as_fd on a closed DirFd must panic, not be UB");
+        assert!(res.is_err(), "borrow_fd on a closed DirFd must panic, not be UB");
+        let stale = DirFd::from(0);
+        stale.clear();
+        assert!(!stale.is_open());
+        let res = std::panic::catch_unwind(|| {
+            let _ = unsafe { stale.borrow_fd() };
+        });
+        assert!(res.is_err(), "borrow_fd on a stale DirFd must panic, not be UB");
     }
 
     #[test]
