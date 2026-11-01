@@ -4,8 +4,8 @@
 // own unique temp directory (tests run in parallel), cleaned up on drop.
 
 use dirhandle::{
-    birth_time, fstatx, open_regular_at, open_regular_statx_at, path_fd_at, path_fd_beneath, statx_at, DirHandle,
-    DirectoryState, EntryExt, OpenHandles, StateChange, STATX_WITH_BTIME,
+    birth_time, fstatx, open_regular_at, open_regular_statx_at, partition_dirs_first, path_fd_at, path_fd_beneath,
+    statx_at, DirHandle, DirectoryState, EntryExt, OpenHandles, StateChange, STATX_WITH_BTIME,
 };
 use std::collections::hash_map::DefaultHasher;
 use std::ffi::{CString, OsStr};
@@ -269,6 +269,14 @@ fn iteration_basics() {
     assert_eq!(it.size_hint().0, 3, "the rest of the small directory is buffered");
     drop(it);
     assert_eq!(h.iter().count(), 4);
+
+    // partition_dirs_first: directories first, the count says where they end
+    let mut all: Vec<EntryExt> = h.iter_untracked().collect();
+    let n: usize = partition_dirs_first(&mut all);
+    assert_eq!(n, 2);
+    assert!(all[..n].iter().all(|e| e.is_dir()));
+    assert!(all[n..].iter().all(|e| !e.is_dir()));
+    drop(all);
 
     // for_each operates on the raw stream, including `.` and `..`
     let mut raw_count: usize = 0;

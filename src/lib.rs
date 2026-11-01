@@ -1609,10 +1609,15 @@ impl DirHandle {
 
 /**
 Move the directory entries to the front of `entries` (in place, order
-within each half not kept) and return how many there are. Entries whose
-type cannot be determined count as non-directories, as everywhere else.
+within each half not kept) and return how many there are, so that
+subdirectories and the rest can be scheduled differently: `entries[..n]`
+are the directories, `entries[n..]` everything else. Entries whose type
+cannot be determined count as non-directories, as everywhere else. One
+`is_dir()` per entry - on a filesystem without `d_type` that is one
+`fstatat` each, cached in the entry. What `iter_sorted()` runs before
+sorting the two halves.
 */
-fn partition_dirs_first(entries: &mut [EntryExt<'_>]) -> usize {
+pub fn partition_dirs_first(entries: &mut [EntryExt<'_>]) -> usize {
     let mut n_dirs: usize = 0;
     for i in 0..entries.len() {
         if entries[i].is_dir() {
