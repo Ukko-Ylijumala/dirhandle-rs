@@ -4,6 +4,7 @@
 // re-export the crate: downstream can name them without a version-matched dep
 pub use nix;
 
+use bitflags::bitflags;
 use custom_xxh3::{hash_bytes, QuickXxh3Hasher, Xxh3Hashable};
 use dashmap::{mapref::one::RefMut, DashMap};
 use enhvec::{EnhVec, Sorting};
@@ -11,7 +12,7 @@ use miniutils::{ToDebug, ToDisplay};
 use nix::{
     dir::{Dir, Entry, Iter, Type},
     errno::Errno,
-    fcntl::{fcntl, openat2, readlinkat, renameat2, AtFlags, FcntlArg, OFlag, OpenHow, RenameFlags, ResolveFlag},
+    fcntl::{fcntl, openat2, readlinkat, AtFlags, FcntlArg, OFlag, OpenHow, ResolveFlag},
     sys::stat::{fstat, fstatat, mkdirat, Mode},
     unistd::{unlinkat, UnlinkatFlags},
     NixPath,
@@ -125,6 +126,24 @@ const DIR_STREAM_HEADER:  usize = 48;
 const DIR_STREAM_BUF_MIN: usize = 32 * 1024;
 #[cfg(feature = "size_of")]
 const DIR_STREAM_BUF_MAX: usize = 1024 * 1024;
+
+bitflags! {
+    /**
+    Flags of [rename_at] (`renameat2(2)`). Our own rather than nix's: nix
+    has `RenameFlags` and `renameat2` only on glibc (it calls the libc
+    wrapper), so a musl build would not have the mutator at all - the
+    syscall itself is there on both.
+    */
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+    pub struct RenameFlags: libc::c_uint {
+        /// Fail with `EEXIST` instead of replacing an existing `new_name`.
+        const RENAME_NOREPLACE = libc::RENAME_NOREPLACE;
+        /// Swap the two entries atomically; both must exist.
+        const RENAME_EXCHANGE = libc::RENAME_EXCHANGE;
+        /// Leave a whiteout behind at the source: for overlay / union filesystems only.
+        const RENAME_WHITEOUT = libc::RENAME_WHITEOUT;
+    }
+}
 
 /**
 Since we cannot import [std::sys] directly (it's private), we need to
@@ -2864,7 +2883,22 @@ pub fn rename_at<Fd1: AsFd, P1: ?Sized + NixPath, Fd2: AsFd, P2: ?Sized + NixPat
 ) -> io::Result<()> {
     with_entry_name(name, |name: &CStr| {
         with_entry_name(new_name, |new_name: &CStr| {
-            Ok(renameat2(dirfd, name, new_dirfd, new_name, flags)?)
+            // the syscall, not the libc wrapper: glibc has `renameat2()` (since 2.28), musl has none
+            // SAFETY: both names are valid C strings and both fds borrowed for the call's duration
+            let rc: libc::c_long = unsafe {
+                libc::syscall(
+                    libc::SYS_renameat2,
+                    dirfd.as_fd().as_raw_fd(),
+                    name.as_ptr(),
+                    new_dirfd.as_fd().as_raw_fd(),
+                    new_name.as_ptr(),
+                    flags.bits(),
+                )
+            };
+            match rc {
+                0 => Ok(()),
+                _ => Err(io::Error::last_os_error()),
+            }
         })
     })
 }

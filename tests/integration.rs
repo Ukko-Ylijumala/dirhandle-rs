@@ -6,8 +6,8 @@
 use dirhandle::{
     birth_time, fstatx, mkdir_at, open_regular_at, open_regular_statx_at, partition_dirs_first, path_fd_at,
     path_fd_beneath, rename_at, rmdir_at, statx_at, unlink_at, DirHandle, DirectoryState, EntryExt, EntryOwned,
-    OpenHandles, StateChange, STATX_WITH_BTIME,
-    nix::{fcntl::RenameFlags, sys::stat::Mode},
+    OpenHandles, RenameFlags, StateChange, STATX_WITH_BTIME,
+    nix::sys::stat::Mode,
 };
 use std::collections::hash_map::DefaultHasher;
 use std::ffi::{CString, OsStr};
@@ -944,7 +944,12 @@ fn statx_and_birth_time() {
     let c_fifo: CString = CString::new(td.path().join("pipe").as_os_str().as_bytes()).unwrap();
     assert_eq!(unsafe { libc::mkfifo(c_fifo.as_ptr(), 0o644) }, 0);
     let meta = fs::metadata(td.path().join("plain.txt")).unwrap();
-    // what std says the birth time is: statx too, so the two must agree, absence included
+    /*
+    what std says the birth time is: statx too, so the two must agree,
+    absence included - on glibc only, std on musl has no statx and never a
+    birth time, so nothing to compare against there
+    */
+    let std_btime: bool = cfg!(target_env = "gnu");
     let created: Option<(i64, i64)> = meta
         .created()
         .ok()
@@ -961,7 +966,9 @@ fn statx_and_birth_time() {
     let st: libc::statx = statx_at(&h, c"plain.txt", STATX_WITH_BTIME).unwrap();
     assert_eq!((st.stx_size, st.stx_ino), (10, meta.ino()));
     assert_eq!((st.stx_mtime.tv_sec, i64::from(st.stx_mtime.tv_nsec)), (meta.mtime(), meta.mtime_nsec()));
-    assert_eq!(birth_time(&st), created);
+    if std_btime {
+        assert_eq!(birth_time(&st), created);
+    }
     let st: libc::statx = statx_at(&h, c"link", libc::STATX_TYPE).unwrap();
     assert_eq!(libc::mode_t::from(st.stx_mode) & libc::S_IFMT, libc::S_IFLNK);
     // the kernel may fill more than asked, so only the mask says what is there
@@ -985,7 +992,9 @@ fn statx_and_birth_time() {
     let plain: &EntryExt = entries.iter().find(|e| e.name_as_bytes() == b"plain.txt").unwrap();
     assert_eq!(plain.statx(libc::STATX_SIZE).unwrap().stx_size, 10);
     assert!(!plain.is_statted(), "statx() does not fill the stat cache");
-    assert_eq!(plain.btime().map(|t| t.get().floor() as i64), created.map(|(secs, _)| secs));
+    if std_btime {
+        assert_eq!(plain.btime().map(|t| t.get().floor() as i64), created.map(|(secs, _)| secs));
+    }
     assert_eq!(plain.open_regular_statx(STATX_WITH_BTIME).unwrap().1.stx_size, 10);
     assert!(!plain.is_statted(), "open_regular_statx() does not either");
 }

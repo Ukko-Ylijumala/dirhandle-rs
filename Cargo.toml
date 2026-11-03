@@ -20,7 +20,10 @@ size_of = ["dep:size-of"]
 serde = ["dep:serde"]
 
 [dependencies]
-libc = "0.2"
+# 0.2.190: statx on musl too
+libc = "0.2.190"
+# RenameFlags (already in the tree through nix)
+bitflags = "2"
 tracing = "0.1"
 custom_xxh3 = { git = "https://github.com/Ukko-Ylijumala/custom_xxh3", features = ["size_of"] }
 timesince = { git = "https://github.com/Ukko-Ylijumala/timesince-rs" }
